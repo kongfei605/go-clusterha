@@ -1,7 +1,10 @@
 package clusterha
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -72,6 +75,63 @@ func TestMetadataFSMApplyFaultPersistsAcrossRestart(t *testing.T) {
 	}
 	if _, ok := restarted.State().Values["must-not-apply"]; ok {
 		t.Fatal("faulted FSM mutated state after its first apply fault")
+	}
+}
+
+func TestMetadataFSMApplyFaultBlocksSnapshotAndRestoresFromState(t *testing.T) {
+	fsm := newMetadataFSM("cluster")
+	result := fsm.Apply(&raft.Log{Index: 17, Data: mustJSON(t, Command{
+		ID: "future", Type: CommandAcquireLeadership, ProtocolVersion: 2, CommandVersion: 2,
+	})}).(applyResult)
+	if result.Error == "" {
+		t.Fatal("expected unsupported command failure")
+	}
+	state := fsm.State()
+	if state.ApplyFault == nil || state.ApplyFault.Index != 17 || state.ApplyFault.Error == "" {
+		t.Fatalf("apply fault missing from metadata state: %#v", state.ApplyFault)
+	}
+	if _, err := fsm.Snapshot(); err == nil {
+		t.Fatal("faulted FSM was allowed to create a snapshot")
+	}
+
+	persistedState := newMetadataFSM("cluster").State()
+	persistedState.ApplyFault = &FSMApplyFault{Index: 23, Error: "snapshot fault"}
+	data := mustJSON(t, persistedState)
+	restarted := newMetadataFSM("cluster")
+	faultPath := filepath.Join(t.TempDir(), "fsm-apply-fault.json")
+	if err := restarted.configureApplyFaultFile(faultPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Restore(io.NopCloser(bytes.NewReader(data))); err != nil {
+		t.Fatal(err)
+	}
+	if fault, ok := restarted.ApplyFault(); !ok || fault.Index != 23 || fault.Error != "snapshot fault" {
+		t.Fatalf("snapshot apply fault was not restored: fault=%#v ok=%t", fault, ok)
+	}
+	if _, err := os.Stat(faultPath); err != nil {
+		t.Fatalf("snapshot apply fault was not persisted to sidecar: %v", err)
+	}
+}
+
+func TestMetadataFSMApplyFaultPersistenceErrorIsExposedInStatus(t *testing.T) {
+	fsm := newMetadataFSM("cluster")
+	fsm.faultFile = t.TempDir()
+	result := fsm.Apply(&raft.Log{Index: 17, Data: mustJSON(t, Command{
+		ID: "future", Type: CommandAcquireLeadership, ProtocolVersion: 2, CommandVersion: 2,
+	})}).(applyResult)
+	if result.Error == "" {
+		t.Fatal("expected unsupported command failure")
+	}
+	if fsm.ApplyFaultPersistError() == "" {
+		t.Fatal("expected apply fault sidecar persistence error")
+	}
+	node := &Node{cfg: Config{}, fsm: fsm, capabilities: SupportedNodeCapabilities()}
+	node.updateStatus(RoleFollower, "", "", fsm.State(), map[string]string{
+		"term": "1", "commit_index": "17", "applied_index": "17",
+	}, false, time.Time{}, "", time.Now())
+	status := node.Status()
+	if status.FSMApplyPersistError == "" {
+		t.Fatalf("status did not expose apply fault persistence error: %#v", status)
 	}
 }
 

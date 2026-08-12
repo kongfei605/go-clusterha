@@ -37,6 +37,26 @@ func TestValidateJoiningNodeStatusRequiresHealthyConsensusState(t *testing.T) {
 	}
 }
 
+func TestValidateCapabilityActivationVotersRequiresLeaderEligibleVoter(t *testing.T) {
+	gate := CapabilityGate{
+		ProtocolVersion: 1, CommandVersion: 1, ManifestSchemaVersion: 1,
+		DatasetSchemaVersions:  map[string]uint32{"*": 1},
+		MinimumVoterCapability: 1, MinimumLeaderCapability: 2,
+	}
+	voters := map[string]NodeCapabilities{
+		"node-a": SupportedNodeCapabilities(),
+		"node-b": SupportedNodeCapabilities(),
+		"node-c": SupportedNodeCapabilities(),
+	}
+	if err := validateCapabilityActivationVoters(voters, gate); err == nil {
+		t.Fatal("capability gate with no leader-eligible voter was accepted")
+	}
+	voters["node-b"] = testV2Capabilities()
+	if err := validateCapabilityActivationVoters(voters, gate); err != nil {
+		t.Fatalf("capability gate with one leader-eligible voter was rejected: %v", err)
+	}
+}
+
 func TestRefreshPeerRegistryRevokesRemovedOperationMember(t *testing.T) {
 	fsm := newMetadataFSM("cluster")
 	members := map[string]Member{

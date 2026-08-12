@@ -82,6 +82,7 @@ type Status struct {
 	FSMRevision              uint64           `json:"fsm_revision"`
 	FSMApplyError            string           `json:"fsm_apply_error,omitempty"`
 	FSMApplyErrorIndex       uint64           `json:"fsm_apply_error_index,omitempty"`
+	FSMApplyPersistError     string           `json:"fsm_apply_persist_error,omitempty"`
 }
 
 const membershipOperationMetadataKey = "cluster/membership_operation"
@@ -584,10 +585,8 @@ func (n *Node) ActivateCapabilities(ctx context.Context, commandID string, gate 
 	if err != nil {
 		return 0, err
 	}
-	for nodeID, capabilities := range voters {
-		if !capabilities.SupportsGate(gate, false) {
-			return 0, fmt.Errorf("voter %q does not support requested capability gate", nodeID)
-		}
+	if err := validateCapabilityActivationVoters(voters, gate); err != nil {
+		return 0, err
 	}
 	payload, _ := json.Marshal(activateCapabilitiesPayload{Gate: gate})
 	state := n.Metadata()
@@ -597,6 +596,22 @@ func (n *Node) ActivateCapabilities(ctx context.Context, commandID string, gate 
 		Payload: payload, CreatedAt: time.Now().UTC()}
 	result, err := n.apply(command, 5*time.Second)
 	return result.Revision, err
+}
+
+func validateCapabilityActivationVoters(voters map[string]NodeCapabilities, gate CapabilityGate) error {
+	leaderEligibleVoter := ""
+	for nodeID, capabilities := range voters {
+		if !capabilities.SupportsGate(gate, false) {
+			return fmt.Errorf("voter %q does not support requested capability gate", nodeID)
+		}
+		if leaderEligibleVoter == "" && capabilities.SupportsGate(gate, true) {
+			leaderEligibleVoter = nodeID
+		}
+	}
+	if leaderEligibleVoter == "" {
+		return fmt.Errorf("no healthy voter supports requested leader capability gate")
+	}
+	return nil
 }
 
 func (n *Node) voterStatuses(ctx context.Context, activeGate CapabilityGate) (map[string]NodeCapabilities, error) {
@@ -613,8 +628,11 @@ func (n *Node) voterStatuses(ctx context.Context, activeGate CapabilityGate) (ma
 		nodeID := string(voter.ID)
 		if nodeID == n.cfg.NodeID {
 			status := n.Status()
-			if !status.FSMHealthy || !capabilityGatesEqual(status.ActiveCapabilityGate, activeGate) {
+			if !status.FSMHealthy || status.FSMApplyError != "" || !capabilityGatesEqual(status.ActiveCapabilityGate, activeGate) {
 				return nil, fmt.Errorf("local voter is not healthy on the active capability gate")
+			}
+			if status.AppliedIndex < status.CommitIndex {
+				return nil, fmt.Errorf("local voter is not caught up: applied=%d commit=%d", status.AppliedIndex, status.CommitIndex)
 			}
 			result[nodeID] = n.capabilities
 			continue
@@ -1914,12 +1932,14 @@ func (n *Node) updateStatus(role string, leaderID raft.ServerID, leaderAddr raft
 	n.status.FSMRevision = state.Revision
 	n.status.FSMApplyError = ""
 	n.status.FSMApplyErrorIndex = 0
+	n.status.FSMApplyPersistError = ""
 	if n.fsm != nil {
 		if fault, ok := n.fsm.ApplyFault(); ok {
 			n.status.FSMHealthy = false
 			n.status.FSMApplyError = fault.Error
 			n.status.FSMApplyErrorIndex = fault.Index
 		}
+		n.status.FSMApplyPersistError = n.fsm.ApplyFaultPersistError()
 	}
 	if manifest, ok := state.Snapshots[state.ActiveSnapshot]; ok {
 		n.status.CommittedGeneration = manifest.Generation

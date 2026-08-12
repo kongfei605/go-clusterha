@@ -44,6 +44,7 @@ type MetadataState struct {
 	ActiveSnapshot      string                     `json:"active_snapshot,omitempty"`
 	ActiveSnapshotIndex uint64                     `json:"active_snapshot_index"`
 	CapabilityGate      CapabilityGate             `json:"capability_gate"`
+	ApplyFault          *FSMApplyFault             `json:"apply_fault,omitempty"`
 	AppliedCommands     map[string]AppliedCommand  `json:"applied_commands,omitempty"`
 }
 
@@ -58,6 +59,7 @@ func (s *MetadataState) UnmarshalJSON(data []byte) error {
 	}
 	*s = MetadataState(raw.metadataState)
 	s.CapabilityGate = normalizeCapabilityGate(s.CapabilityGate)
+	s.ApplyFault = cloneFSMApplyFaultPtr(s.ApplyFault)
 	s.AppliedCommands = make(map[string]AppliedCommand)
 	if len(raw.AppliedCommands) == 0 || string(raw.AppliedCommands) == "null" {
 		return nil
@@ -109,12 +111,13 @@ type applyResult struct {
 }
 
 type metadataFSM struct {
-	mu           sync.RWMutex
-	state        MetadataState
-	capabilities NodeCapabilities
-	faultMu      sync.RWMutex
-	applyFault   FSMApplyFault
-	faultFile    string
+	mu                sync.RWMutex
+	state             MetadataState
+	capabilities      NodeCapabilities
+	faultMu           sync.RWMutex
+	applyFault        FSMApplyFault
+	faultPersistError string
+	faultFile         string
 }
 
 type FSMApplyFault struct {
@@ -289,7 +292,14 @@ func (f *metadataFSM) recordApplyFaultLocked(index uint64, message string) apply
 	f.faultMu.Lock()
 	if f.applyFault.Error == "" {
 		f.applyFault = FSMApplyFault{Index: index, Error: message}
-		_ = persistFSMApplyFault(f.faultFile, f.applyFault)
+		f.state.ApplyFault = cloneFSMApplyFaultPtr(&f.applyFault)
+		if err := persistFSMApplyFault(f.faultFile, f.applyFault); err != nil {
+			f.faultPersistError = err.Error()
+		} else {
+			f.faultPersistError = ""
+		}
+	} else if f.state.ApplyFault == nil {
+		f.state.ApplyFault = cloneFSMApplyFaultPtr(&f.applyFault)
 	}
 	f.faultMu.Unlock()
 	return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: message}
@@ -301,19 +311,34 @@ func (f *metadataFSM) ApplyFault() (FSMApplyFault, bool) {
 	return f.applyFault, f.applyFault.Error != ""
 }
 
+func (f *metadataFSM) ApplyFaultPersistError() string {
+	f.faultMu.RLock()
+	defer f.faultMu.RUnlock()
+	return f.faultPersistError
+}
+
 func (f *metadataFSM) configureApplyFaultFile(path string) error {
 	f.faultMu.Lock()
-	defer f.faultMu.Unlock()
 	f.faultFile = path
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			f.faultMu.Unlock()
 			return nil
 		}
+		f.faultMu.Unlock()
 		return err
 	}
 	if err := json.Unmarshal(data, &f.applyFault); err != nil {
+		f.faultMu.Unlock()
 		return fmt.Errorf("decode persisted FSM apply fault: %w", err)
+	}
+	fault := cloneFSMApplyFaultPtr(&f.applyFault)
+	f.faultMu.Unlock()
+	if fault != nil {
+		f.mu.Lock()
+		f.state.ApplyFault = fault
+		f.mu.Unlock()
 	}
 	return nil
 }
@@ -384,6 +409,9 @@ func commandDigest(command Command) (string, error) {
 }
 
 func (f *metadataFSM) Snapshot() (raft.FSMSnapshot, error) {
+	if fault, faulted := f.ApplyFault(); faulted {
+		return nil, fmt.Errorf("FSM apply fault at index %d blocks metadata snapshot: %s", fault.Index, fault.Error)
+	}
 	state := f.State()
 	return &metadataSnapshot{state: state}, nil
 }
@@ -407,6 +435,19 @@ func (f *metadataFSM) Restore(reader io.ReadCloser) error {
 		state.AppliedCommands = make(map[string]AppliedCommand)
 	}
 	state.CapabilityGate = normalizeCapabilityGate(state.CapabilityGate)
+	state.ApplyFault = cloneFSMApplyFaultPtr(state.ApplyFault)
+	if state.ApplyFault != nil {
+		f.faultMu.Lock()
+		f.applyFault = *state.ApplyFault
+		if err := persistFSMApplyFault(f.faultFile, f.applyFault); err != nil {
+			f.faultPersistError = err.Error()
+		} else {
+			f.faultPersistError = ""
+		}
+		f.faultMu.Unlock()
+	} else if fault, faulted := f.ApplyFault(); faulted {
+		state.ApplyFault = cloneFSMApplyFaultPtr(&fault)
+	}
 	f.mu.Lock()
 	f.state = state
 	f.mu.Unlock()
@@ -436,6 +477,7 @@ func (*metadataSnapshot) Release() {}
 func cloneMetadataState(state MetadataState) MetadataState {
 	copyState := state
 	copyState.CapabilityGate = normalizeCapabilityGate(state.CapabilityGate)
+	copyState.ApplyFault = cloneFSMApplyFaultPtr(state.ApplyFault)
 	copyState.Values = make(map[string]json.RawMessage, len(state.Values))
 	for key, value := range state.Values {
 		copyState.Values[key] = append(json.RawMessage(nil), value...)
@@ -449,4 +491,12 @@ func cloneMetadataState(state MetadataState) MetadataState {
 		copyState.AppliedCommands[key] = command
 	}
 	return copyState
+}
+
+func cloneFSMApplyFaultPtr(fault *FSMApplyFault) *FSMApplyFault {
+	if fault == nil || fault.Error == "" {
+		return nil
+	}
+	copyFault := *fault
+	return &copyFault
 }
