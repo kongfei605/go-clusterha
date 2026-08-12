@@ -47,6 +47,7 @@ type Manifest struct {
 
 type DatasetRef struct {
 	Name              string    `json:"name"`
+	SchemaVersion     uint32    `json:"schema_version"`
 	Scope             string    `json:"scope"`
 	BlobHash          string    `json:"blob_hash"`
 	Encoding          string    `json:"encoding"`
@@ -58,6 +59,27 @@ type DatasetRef struct {
 	Required          bool      `json:"required"`
 	Stale             bool      `json:"stale"`
 	UncompressedBytes int64     `json:"uncompressed_bytes,omitempty"`
+}
+
+func validateManifestCapability(manifest Manifest, gate CapabilityGate) error {
+	gate = normalizeCapabilityGate(gate)
+	manifestVersion := manifest.SchemaVersion
+	if manifestVersion == 0 {
+		manifestVersion = LegacyManifestSchemaVersion
+	}
+	if manifestVersion != gate.ManifestSchemaVersion {
+		return fmt.Errorf("manifest schema version %d is not active; active version is %d", manifestVersion, gate.ManifestSchemaVersion)
+	}
+	for name, dataset := range manifest.Datasets {
+		version := dataset.SchemaVersion
+		if version == 0 {
+			version = LegacyDatasetSchemaVersion
+		}
+		if wanted := gate.DatasetSchemaVersion(name); version != wanted {
+			return fmt.Errorf("dataset %q schema version %d is not active; active version is %d", name, version, wanted)
+		}
+	}
+	return nil
 }
 
 func cloneManifest(manifest Manifest) Manifest {

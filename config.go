@@ -34,6 +34,7 @@ type Config struct {
 	BootstrapExpect            int       `toml:"bootstrap_expect"`
 	JoinExisting               bool      `toml:"join_existing"`
 	InitialMembers             []string  `toml:"initial_members"`
+	MembershipAdminNodeIDs     []string  `toml:"membership_admin_node_ids"`
 	ReadConsistency            string    `toml:"read_consistency"`
 	MaxLeaderContactAge        Duration  `toml:"max_leader_contact_age"`
 	MaxQuorumVerificationAge   Duration  `toml:"max_quorum_verification_age"`
@@ -137,7 +138,7 @@ func ValidateConfig(cfg Config) error {
 			}
 		}
 	}
-	if !foundSelf {
+	if !foundSelf && !cfg.JoinExisting {
 		return fmt.Errorf("cluster.node_id %q is not present in cluster.initial_members", cfg.NodeID)
 	}
 	if err := validateHostPort(cfg.RaftAdvertiseAddr, "cluster.raft_advertise_addr"); err != nil {

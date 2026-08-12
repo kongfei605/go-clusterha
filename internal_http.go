@@ -3,6 +3,7 @@ package clusterha
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -38,6 +39,53 @@ func (n *Node) startInternalServer() error {
 		}
 		n.refreshStatus(false)
 		writeJSON(w, http.StatusOK, n.Status())
+	})
+	mux.HandleFunc("POST /internal/v1/join/prepare", func(w http.ResponseWriter, _ *http.Request) {
+		if !n.isUnjoined() {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "node is not in unjoined state"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"cluster_id":            n.cfg.ClusterID,
+			"node_id":               n.cfg.NodeID,
+			"raft_advertise_addr":   n.cfg.RaftAdvertiseAddr,
+			"internal_api_url":      n.cfg.InternalAPIAdvertiseAddr,
+			"join_existing":         n.cfg.JoinExisting,
+			"initial_member_count":  len(n.cfg.InitialMembers),
+			"bootstrap_expectation": n.cfg.BootstrapExpect,
+			"capabilities":          SupportedNodeCapabilities(),
+		})
+	})
+	mux.HandleFunc("POST /internal/v1/admin/nodes", func(w http.ResponseWriter, r *http.Request) {
+		if !n.authorizeMembershipAdmin(r) {
+			http.Error(w, "membership administrator certificate required", http.StatusForbidden)
+			return
+		}
+		var member Member
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&member); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		if err := n.JoinVoter(ctx, member); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"joined": member})
+	})
+	mux.HandleFunc("DELETE /internal/v1/admin/nodes/{nodeID}", func(w http.ResponseWriter, r *http.Request) {
+		if !n.authorizeMembershipAdmin(r) {
+			http.Error(w, "membership administrator certificate required", http.StatusForbidden)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		if err := n.RemoveServer(ctx, r.PathValue("nodeID")); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("PUT /internal/v1/blobs/{hash...}", func(w http.ResponseWriter, r *http.Request) {
 		hash := strings.TrimPrefix(r.PathValue("hash"), "/")
@@ -107,6 +155,14 @@ func (n *Node) startInternalServer() error {
 		_ = server.Serve(tlsListener)
 	}()
 	return nil
+}
+
+func (n *Node) authorizeMembershipAdmin(r *http.Request) bool {
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		return false
+	}
+	identity := r.TLS.PeerCertificates[0].Subject.CommonName
+	return containsString(n.cfg.MembershipAdminNodeIDs, identity)
 }
 
 func (n *Node) requireMemberCertificate(next http.Handler) http.Handler {

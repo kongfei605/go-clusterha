@@ -38,6 +38,7 @@ var (
 	ErrNotBusinessLeader = errors.New("node does not hold valid business leadership")
 	ErrNodeNotStarted    = errors.New("cluster node is not started")
 	ErrProxyUnavailable  = errors.New("verified leader proxy is unavailable")
+	errNodeUnjoined      = errors.New("cluster node is waiting to join")
 )
 
 const (
@@ -49,29 +50,57 @@ const (
 )
 
 type Status struct {
-	Enabled                  bool         `json:"enabled"`
-	Ready                    bool         `json:"ready"`
-	Readiness                string       `json:"readiness"`
-	Reason                   string       `json:"reason,omitempty"`
-	ClusterID                string       `json:"cluster_id,omitempty"`
-	NodeID                   string       `json:"node_id,omitempty"`
-	Role                     string       `json:"role"`
-	LeaderID                 string       `json:"leader_id,omitempty"`
-	LeaderAddress            string       `json:"leader_address,omitempty"`
-	LeaderEpoch              uint64       `json:"leader_epoch"`
-	Term                     uint64       `json:"term"`
-	CommitIndex              uint64       `json:"commit_index"`
-	AppliedIndex             uint64       `json:"applied_index"`
-	HasQuorum                bool         `json:"has_quorum"`
-	QuorumVerifiedAt         time.Time    `json:"quorum_verified_at,omitempty"`
-	LastLeaderContactAt      time.Time    `json:"last_leader_contact_at,omitempty"`
-	ReadConsistency          string       `json:"read_consistency,omitempty"`
-	EmergencyStaleRead       bool         `json:"emergency_stale_read"`
-	MaxLeaderContactAge      string       `json:"max_leader_contact_age,omitempty"`
-	MaxQuorumVerificationAge string       `json:"max_quorum_verification_age,omitempty"`
-	CommittedGeneration      Generation   `json:"committed_generation"`
-	CommittedGenerationIndex uint64       `json:"committed_generation_index"`
-	AvailableGenerations     []Generation `json:"available_generations,omitempty"`
+	Enabled                  bool             `json:"enabled"`
+	Ready                    bool             `json:"ready"`
+	Readiness                string           `json:"readiness"`
+	Reason                   string           `json:"reason,omitempty"`
+	ClusterID                string           `json:"cluster_id,omitempty"`
+	NodeID                   string           `json:"node_id,omitempty"`
+	Role                     string           `json:"role"`
+	LeaderID                 string           `json:"leader_id,omitempty"`
+	LeaderAddress            string           `json:"leader_address,omitempty"`
+	LeaderEpoch              uint64           `json:"leader_epoch"`
+	Term                     uint64           `json:"term"`
+	CommitIndex              uint64           `json:"commit_index"`
+	AppliedIndex             uint64           `json:"applied_index"`
+	HasQuorum                bool             `json:"has_quorum"`
+	QuorumVerifiedAt         time.Time        `json:"quorum_verified_at,omitempty"`
+	LastLeaderContactAt      time.Time        `json:"last_leader_contact_at,omitempty"`
+	ReadConsistency          string           `json:"read_consistency,omitempty"`
+	EmergencyStaleRead       bool             `json:"emergency_stale_read"`
+	MaxLeaderContactAge      string           `json:"max_leader_contact_age,omitempty"`
+	MaxQuorumVerificationAge string           `json:"max_quorum_verification_age,omitempty"`
+	CommittedGeneration      Generation       `json:"committed_generation"`
+	CommittedGenerationIndex uint64           `json:"committed_generation_index"`
+	AvailableGenerations     []Generation     `json:"available_generations,omitempty"`
+	ProtocolVersion          uint32           `json:"protocol_version"`
+	CommandVersion           uint32           `json:"command_version"`
+	Capabilities             NodeCapabilities `json:"capabilities"`
+	ActiveCapabilityGate     CapabilityGate   `json:"active_capability_gate"`
+	LeaderEligible           bool             `json:"leader_eligible"`
+}
+
+const membershipOperationMetadataKey = "cluster/membership_operation"
+
+const (
+	MembershipOperationJoin   = "join"
+	MembershipOperationRemove = "remove"
+	MembershipPhasePrepared   = "prepared"
+	MembershipPhaseNonVoter   = "non_voter"
+	MembershipPhaseCaughtUp   = "caught_up"
+	MembershipPhaseVoter      = "voter"
+	MembershipPhaseRemoved    = "removed"
+	MembershipPhaseCompleted  = "completed"
+)
+
+type MembershipOperation struct {
+	ID           string           `json:"id"`
+	Type         string           `json:"type"`
+	Phase        string           `json:"phase"`
+	Member       Member           `json:"member"`
+	Capabilities NodeCapabilities `json:"capabilities,omitempty"`
+	CreatedAt    time.Time        `json:"created_at"`
+	UpdatedAt    time.Time        `json:"updated_at"`
 }
 
 type LeadershipEvent struct {
@@ -94,13 +123,17 @@ type Node struct {
 	cancel           context.CancelFunc
 	done             chan struct{}
 	started          bool
+	unjoined         bool
 	subs             map[chan LeadershipEvent]struct{}
 	leadership       LeadershipEvent
 	servingReady     func() (bool, string)
 	proxyHandler     http.Handler
 	stagingBlobs     map[string]int
 	peers            *peerRegistry
+	pendingMembers   map[string]Member
 	blobPutSem       chan struct{}
+	configurationMu  sync.Mutex
+	membershipMu     sync.Mutex
 }
 
 func NewNode(cfg Config) (*Node, error) {
@@ -109,7 +142,7 @@ func NewNode(cfg Config) (*Node, error) {
 		return nil, err
 	}
 	node := &Node{cfg: cfg, done: make(chan struct{}), subs: make(map[chan LeadershipEvent]struct{}),
-		stagingBlobs: make(map[string]int), blobPutSem: make(chan struct{}, cfg.MaxSnapshotBlobPuts)}
+		stagingBlobs: make(map[string]int), pendingMembers: make(map[string]Member), blobPutSem: make(chan struct{}, cfg.MaxSnapshotBlobPuts)}
 	if !cfg.Enabled {
 		node.status = Status{Enabled: false, Ready: true, Readiness: ReadinessReady, Role: RoleDisabled,
 			Reason: "cluster disabled; running existing single-instance mode"}
@@ -143,7 +176,9 @@ func (n *Node) Start(parent context.Context) error {
 	n.cancel = cancel
 	n.mu.Unlock()
 
-	if err := n.startRaft(); err != nil {
+	err := n.startRaft()
+	unjoined := errors.Is(err, errNodeUnjoined)
+	if err != nil && !unjoined {
 		cancel()
 		n.mu.Lock()
 		n.started = false
@@ -160,9 +195,13 @@ func (n *Node) Start(parent context.Context) error {
 		n.mu.Unlock()
 		return err
 	}
+	if unjoined {
+		n.updateUnjoinedStatus()
+	}
 	go n.monitor(ctx)
 	go n.watchRaftLeadership(ctx)
 	go n.snapshotMaintenance(ctx)
+	go n.membershipMaintenance(ctx)
 	return nil
 }
 
@@ -207,9 +246,10 @@ func (n *Node) startRaft() error {
 	}
 	if !existing {
 		if n.cfg.JoinExisting {
-			return errors.New("cluster.join_existing=true requires a prior join operation; refusing to bootstrap empty data directory")
-		}
-		if err := raft.BootstrapCluster(config, store, store, snapshots, transport, configuration); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
+			n.mu.Lock()
+			n.unjoined = true
+			n.mu.Unlock()
+		} else if err := raft.BootstrapCluster(config, store, store, snapshots, transport, configuration); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
 			transport.Close()
 			_ = store.Close()
 			return fmt.Errorf("bootstrap raft cluster: %w", err)
@@ -229,6 +269,9 @@ func (n *Node) startRaft() error {
 	n.store = store
 	n.blobStore = NewBlobStore(filepath.Join(n.cfg.DataDir, "cas"))
 	n.mu.Unlock()
+	if !existing && n.cfg.JoinExisting {
+		return errNodeUnjoined
+	}
 	return nil
 }
 
@@ -264,6 +307,21 @@ func (n *Node) monitor(ctx context.Context) {
 	}
 }
 
+func (n *Node) membershipMaintenance(ctx context.Context) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if n.HasBusinessLeadership() {
+				_ = n.reconcileMembershipOperation(ctx)
+			}
+		}
+	}
+}
+
 func (n *Node) watchRaftLeadership(ctx context.Context) {
 	n.mu.RLock()
 	r := n.raft
@@ -294,10 +352,18 @@ func (n *Node) refreshStatus(verify bool) {
 	fsm := n.fsm
 	n.mu.RUnlock()
 	if r == nil || fsm == nil {
+		if n.isUnjoined() {
+			n.updateUnjoinedStatus()
+		}
 		return
 	}
 	stats := r.Stats()
 	leaderAddr, leaderID := r.LeaderWithID()
+	if n.isUnjoined() && n.raftConfigurationContainsSelf(r) {
+		n.mu.Lock()
+		n.unjoined = false
+		n.mu.Unlock()
+	}
 	state := fsm.State()
 	now := time.Now()
 	role := RoleFollower
@@ -305,6 +371,13 @@ func (n *Node) refreshStatus(verify bool) {
 	var verifiedAt time.Time
 	if r.State() == raft.Leader {
 		role = RoleLeaderWarming
+		if !SupportedNodeCapabilities().SupportsGate(state.CapabilityGate, true) {
+			reason := "node does not satisfy the active minimum leader capability"
+			n.updateStatus(role, leaderID, leaderAddr, state, stats, false, time.Time{}, reason, now)
+			n.setLeadership(false, state.LeaderEpoch, reason)
+			go func() { _ = r.LeadershipTransfer().Error() }()
+			return
+		}
 		if state.LeaderOwner != n.cfg.NodeID || state.LastLeadershipTerm != parseUint(stats["term"]) {
 			if err := n.acquireLeadership(parseUint(stats["term"])); err != nil {
 				n.updateStatus(role, leaderID, leaderAddr, state, stats, false, time.Time{}, err.Error(), now)
@@ -343,13 +416,50 @@ func (n *Node) refreshStatus(verify bool) {
 	n.setLeadership(role == RoleLeader && hasQuorum, state.LeaderEpoch, reason)
 }
 
+func (n *Node) isUnjoined() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.unjoined
+}
+
+func (n *Node) updateUnjoinedStatus() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.status.Role = RoleFollower
+	n.status.Ready = false
+	n.status.Readiness = ReadinessNotReady
+	n.status.Reason = "node is waiting for cluster join"
+	n.status.LeaderID = ""
+	n.status.LeaderAddress = ""
+	n.status.HasQuorum = false
+	n.status.ProtocolVersion = CurrentProtocolVersion
+	n.status.CommandVersion = CurrentCommandVersion
+	n.status.Capabilities = SupportedNodeCapabilities()
+	n.status.ActiveCapabilityGate = LegacyCapabilityGate()
+	n.status.LeaderEligible = false
+}
+
+func (n *Node) raftConfigurationContainsSelf(r *raft.Raft) bool {
+	future := r.GetConfiguration()
+	if err := future.Error(); err != nil {
+		return false
+	}
+	for _, server := range future.Configuration().Servers {
+		if server.ID == raft.ServerID(n.cfg.NodeID) {
+			return true
+		}
+	}
+	return false
+}
+
 func (n *Node) acquireLeadership(term uint64) error {
 	if term == 0 {
 		return errors.New("raft term is unavailable")
 	}
 	payload, _ := json.Marshal(acquireLeadershipPayload{NodeID: n.cfg.NodeID, Term: term})
+	protocolVersion, commandVersion := n.activeCommandVersions()
 	command := Command{ID: fmt.Sprintf("acquire/%d/%s", term, n.cfg.NodeID), Type: CommandAcquireLeadership,
-		Payload: payload, CreatedAt: time.Unix(0, 0).UTC()}
+		ProtocolVersion: protocolVersion, CommandVersion: commandVersion, Payload: payload, CreatedAt: time.Unix(0, 0).UTC()}
 	if _, err := n.apply(command, 5*time.Second); err != nil {
 		return err
 	}
@@ -365,6 +475,7 @@ func (n *Node) acquireLeadership(term uint64) error {
 	value, _ := json.Marshal(members)
 	payload, _ = json.Marshal(putMetadataPayload{Key: "cluster/members", Value: value})
 	command = Command{ID: "initialize/cluster-members/v1", Type: CommandPutMetadata, ExpectedRevision: &state.Revision,
+		ProtocolVersion: protocolVersion, CommandVersion: commandVersion,
 		LeaderEpoch: state.LeaderEpoch, Payload: payload, CreatedAt: time.Unix(0, 0).UTC()}
 	_, err := n.apply(command, 5*time.Second)
 	return err
@@ -395,6 +506,11 @@ func (n *Node) apply(command Command, timeout time.Duration) (applyResult, error
 	return result, nil
 }
 
+func (n *Node) activeCommandVersions() (uint32, uint32) {
+	gate := normalizeCapabilityGate(n.Metadata().CapabilityGate)
+	return gate.ProtocolVersion, gate.CommandVersion
+}
+
 func (n *Node) PutMetadata(ctx context.Context, commandID, key string, value any, expectedRevision uint64) (uint64, error) {
 	if err := n.VerifyBusinessLeadership(ctx); err != nil {
 		return 0, err
@@ -405,7 +521,9 @@ func (n *Node) PutMetadata(ctx context.Context, commandID, key string, value any
 	}
 	payload, _ := json.Marshal(putMetadataPayload{Key: key, Value: rawValue})
 	state := n.Metadata()
+	protocolVersion, commandVersion := n.activeCommandVersions()
 	command := Command{ID: commandID, Type: CommandPutMetadata, ExpectedRevision: &expectedRevision,
+		ProtocolVersion: protocolVersion, CommandVersion: commandVersion,
 		LeaderEpoch: state.LeaderEpoch, Payload: payload, CreatedAt: time.Unix(0, 0).UTC()}
 	result, err := n.apply(command, 5*time.Second)
 	return result.Revision, err
@@ -425,21 +543,94 @@ func (n *Node) PutMetadataBatch(ctx context.Context, commandID string, values ma
 	}
 	payload, _ := json.Marshal(putMetadataBatchPayload{Values: rawValues})
 	state := n.Metadata()
+	protocolVersion, commandVersion := n.activeCommandVersions()
 	command := Command{ID: commandID, Type: CommandPutMetadataBatch, ExpectedRevision: &expectedRevision,
+		ProtocolVersion: protocolVersion, CommandVersion: commandVersion,
 		LeaderEpoch: state.LeaderEpoch, Payload: payload, CreatedAt: time.Unix(0, 0).UTC()}
 	result, err := n.apply(command, 5*time.Second)
 	return result.Revision, err
+}
+
+func (n *Node) ActivateCapabilities(ctx context.Context, commandID string, gate CapabilityGate) (uint64, error) {
+	if err := n.VerifyBusinessLeadership(ctx); err != nil {
+		return 0, err
+	}
+	gate = normalizeCapabilityGate(gate)
+	if err := validateCapabilityGate(gate); err != nil {
+		return 0, err
+	}
+	voters, err := n.voterStatuses(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for nodeID, capabilities := range voters {
+		if !capabilities.SupportsGate(gate, false) {
+			return 0, fmt.Errorf("voter %q does not support requested capability gate", nodeID)
+		}
+	}
+	payload, _ := json.Marshal(activateCapabilitiesPayload{Gate: gate})
+	state := n.Metadata()
+	protocolVersion, commandVersion := n.activeCommandVersions()
+	command := Command{ID: commandID, Type: CommandActivateCapabilities, ExpectedRevision: &state.Revision,
+		ProtocolVersion: protocolVersion, CommandVersion: commandVersion, LeaderEpoch: state.LeaderEpoch,
+		Payload: payload, CreatedAt: time.Now().UTC()}
+	result, err := n.apply(command, 5*time.Second)
+	return result.Revision, err
+}
+
+func (n *Node) voterStatuses(ctx context.Context) (map[string]NodeCapabilities, error) {
+	_, voters, err := n.voterConfiguration()
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]NodeCapabilities, len(voters))
+	client, err := n.internalHTTPClient()
+	if err != nil {
+		return nil, err
+	}
+	for _, voter := range voters {
+		nodeID := string(voter.ID)
+		if nodeID == n.cfg.NodeID {
+			result[nodeID] = SupportedNodeCapabilities()
+			continue
+		}
+		base, ok := n.internalAPIURLForNode(nodeID)
+		if !ok {
+			return nil, fmt.Errorf("internal API URL for voter %q is unavailable", nodeID)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/internal/v1/status", nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("read voter %q capabilities: %w", nodeID, err)
+		}
+		var status Status
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&status)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || decodeErr != nil {
+			return nil, fmt.Errorf("read voter %q capabilities returned %s: %v", nodeID, resp.Status, decodeErr)
+		}
+		result[nodeID] = status.Capabilities
+	}
+	return result, nil
 }
 
 func (n *Node) PublishSnapshot(ctx context.Context, commandID string, manifest Manifest, blobs map[string]io.Reader) (uint64, error) {
 	if err := n.VerifyBusinessLeadership(ctx); err != nil {
 		return 0, err
 	}
+	n.configurationMu.Lock()
+	defer n.configurationMu.Unlock()
 	n.mu.RLock()
 	store := n.blobStore
 	n.mu.RUnlock()
 	if store == nil {
 		return 0, ErrNodeNotStarted
+	}
+	if err := validateManifestCapability(manifest, n.Metadata().CapabilityGate); err != nil {
+		return 0, err
 	}
 	n.retainStagingBlobs(manifest)
 	defer n.releaseStagingBlobs(manifest)
@@ -470,7 +661,9 @@ func (n *Node) PublishSnapshot(ctx context.Context, commandID string, manifest M
 	}
 	payload, _ := json.Marshal(commitSnapshotPayload{Manifest: manifest})
 	state := n.Metadata()
+	protocolVersion, commandVersion := n.activeCommandVersions()
 	command := Command{ID: commandID, Type: CommandCommitSnapshot, ExpectedRevision: &state.Revision,
+		ProtocolVersion: protocolVersion, CommandVersion: commandVersion,
 		LeaderEpoch: state.LeaderEpoch, Payload: payload, CreatedAt: time.Unix(0, 0).UTC()}
 	result, err := n.apply(command, 5*time.Second)
 	return result.Revision, err
@@ -813,11 +1006,368 @@ func (n *Node) internalAPIURLForNode(nodeID string) (string, bool) {
 }
 
 func (n *Node) AddVoter(context.Context, Member) error {
-	return errors.New("safe dynamic membership is not implemented; start replacements with join_existing=true and use an external join workflow")
+	return errors.New("safe dynamic membership is not implemented; start replacements with join_existing=true and use JoinVoter")
 }
 
-func (n *Node) RemoveServer(context.Context, string) error {
-	return errors.New("safe dynamic membership is not implemented; use an external audited replacement workflow")
+func (n *Node) RemoveServer(ctx context.Context, nodeID string) error {
+	if err := n.VerifyBusinessLeadership(ctx); err != nil {
+		return err
+	}
+	if nodeID == "" {
+		return errors.New("node_id is required")
+	}
+	if nodeID == n.cfg.NodeID {
+		return errors.New("transfer leadership before removing the current leader")
+	}
+	if operation, ok, err := n.membershipOperation(); err != nil {
+		return err
+	} else if ok && operation.Phase != MembershipPhaseCompleted {
+		if operation.Type != MembershipOperationRemove || operation.Member.NodeID != nodeID {
+			return fmt.Errorf("membership operation %q for node %q is already active", operation.Type, operation.Member.NodeID)
+		}
+		return n.reconcileMembershipOperation(ctx)
+	}
+	members := n.committedMembers()
+	member, ok := members[nodeID]
+	if !ok {
+		return nil
+	}
+	if len(members) <= n.cfg.BootstrapExpect {
+		return fmt.Errorf("removal would reduce committed membership below %d voters", n.cfg.BootstrapExpect)
+	}
+	op := MembershipOperation{ID: fmt.Sprintf("remove/%s/%d", nodeID, time.Now().UnixNano()), Type: MembershipOperationRemove,
+		Phase: MembershipPhasePrepared, Member: member, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if err := n.beginMembershipOperation(ctx, op); err != nil {
+		return err
+	}
+	return n.reconcileMembershipOperation(ctx)
+}
+
+func (n *Node) JoinVoter(ctx context.Context, member Member) error {
+	if err := n.VerifyBusinessLeadership(ctx); err != nil {
+		return err
+	}
+	if member.NodeID == "" || member.Addr == "" || member.InternalAPIURL == "" {
+		return errors.New("node_id, raft address and internal API URL are required")
+	}
+	if member.NodeID == n.cfg.NodeID {
+		return errors.New("cannot join the current leader")
+	}
+	if operation, ok, err := n.membershipOperation(); err != nil {
+		return err
+	} else if ok && operation.Phase != MembershipPhaseCompleted {
+		if operation.Type != MembershipOperationJoin || operation.Member != member {
+			return fmt.Errorf("membership operation %q for node %q is already active", operation.Type, operation.Member.NodeID)
+		}
+		n.addPendingMember(member)
+		n.refreshPeerRegistry()
+		return n.reconcileMembershipOperation(ctx)
+	}
+	if existing, ok := n.committedMembers()[member.NodeID]; ok {
+		if existing == member {
+			return nil
+		}
+		return fmt.Errorf("node %q is already in committed membership with different addresses", member.NodeID)
+	}
+	n.addPendingMember(member)
+	n.refreshPeerRegistry()
+	capabilities, err := n.prepareJoiningMember(ctx, member)
+	if err != nil {
+		n.removePendingMember(member.NodeID)
+		n.refreshPeerRegistry()
+		return err
+	}
+	gate := n.Metadata().CapabilityGate
+	if !capabilities.SupportsGate(gate, false) {
+		n.removePendingMember(member.NodeID)
+		n.refreshPeerRegistry()
+		return fmt.Errorf("node %q does not support the active voter capability gate", member.NodeID)
+	}
+	op := MembershipOperation{ID: fmt.Sprintf("join/%s/%d", member.NodeID, time.Now().UnixNano()), Type: MembershipOperationJoin,
+		Phase: MembershipPhasePrepared, Member: member, Capabilities: capabilities, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if err := n.beginMembershipOperation(ctx, op); err != nil {
+		n.removePendingMember(member.NodeID)
+		n.refreshPeerRegistry()
+		return err
+	}
+	return n.reconcileMembershipOperation(ctx)
+}
+
+func (n *Node) prepareJoiningMember(ctx context.Context, member Member) (NodeCapabilities, error) {
+	base := strings.TrimRight(member.InternalAPIURL, "/")
+	client, err := n.internalHTTPClient()
+	if err != nil {
+		return NodeCapabilities{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/internal/v1/join/prepare", nil)
+	if err != nil {
+		return NodeCapabilities{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return NodeCapabilities{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return NodeCapabilities{}, fmt.Errorf("join prepare for node %s returned %s: %s", member.NodeID, resp.Status, string(body))
+	}
+	var prepared struct {
+		ClusterID          string           `json:"cluster_id"`
+		NodeID             string           `json:"node_id"`
+		RaftAdvertiseAddr  string           `json:"raft_advertise_addr"`
+		InternalAPIURL     string           `json:"internal_api_url"`
+		JoinExisting       bool             `json:"join_existing"`
+		InitialMemberCount int              `json:"initial_member_count"`
+		BootstrapExpect    int              `json:"bootstrap_expectation"`
+		Capabilities       NodeCapabilities `json:"capabilities"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&prepared); err != nil {
+		return NodeCapabilities{}, err
+	}
+	if prepared.ClusterID != n.cfg.ClusterID || prepared.NodeID != member.NodeID || prepared.RaftAdvertiseAddr != member.Addr ||
+		prepared.InternalAPIURL != member.InternalAPIURL || !prepared.JoinExisting || prepared.InitialMemberCount != n.cfg.BootstrapExpect ||
+		prepared.BootstrapExpect != n.cfg.BootstrapExpect {
+		return NodeCapabilities{}, fmt.Errorf("join prepare response for node %s does not match requested membership", member.NodeID)
+	}
+	return prepared.Capabilities, nil
+}
+
+func (n *Node) beginMembershipOperation(ctx context.Context, operation MembershipOperation) error {
+	if existing, ok, err := n.membershipOperation(); err != nil {
+		return err
+	} else if ok && existing.Phase != MembershipPhaseCompleted {
+		if existing.Type == operation.Type && existing.Member == operation.Member {
+			return nil
+		}
+		return fmt.Errorf("membership operation %q for node %q is already active", existing.Type, existing.Member.NodeID)
+	}
+	state := n.Metadata()
+	_, err := n.PutMetadata(ctx, operation.ID+"/prepared", membershipOperationMetadataKey, operation, state.Revision)
+	return err
+}
+
+func (n *Node) membershipOperation() (MembershipOperation, bool, error) {
+	raw, ok := n.Metadata().Values[membershipOperationMetadataKey]
+	if !ok || len(raw) == 0 || string(raw) == "null" {
+		return MembershipOperation{}, false, nil
+	}
+	var operation MembershipOperation
+	if err := json.Unmarshal(raw, &operation); err != nil {
+		return MembershipOperation{}, false, fmt.Errorf("decode membership operation: %w", err)
+	}
+	return operation, true, nil
+}
+
+func (n *Node) reconcileMembershipOperation(ctx context.Context) error {
+	n.membershipMu.Lock()
+	defer n.membershipMu.Unlock()
+	if err := n.VerifyBusinessLeadership(ctx); err != nil {
+		return err
+	}
+	operation, ok, err := n.membershipOperation()
+	if err != nil || !ok || operation.Phase == MembershipPhaseCompleted {
+		return err
+	}
+	n.addPendingMember(operation.Member)
+	defer func() {
+		if latest, exists, _ := n.membershipOperation(); exists &&
+			(latest.Phase == MembershipPhaseCompleted || latest.Type == MembershipOperationRemove && latest.Phase == MembershipPhaseRemoved) {
+			n.removePendingMember(operation.Member.NodeID)
+		}
+		n.refreshPeerRegistry()
+	}()
+	n.refreshPeerRegistry()
+	switch operation.Type {
+	case MembershipOperationJoin:
+		return n.reconcileJoinOperation(ctx, operation)
+	case MembershipOperationRemove:
+		return n.reconcileRemoveOperation(ctx, operation)
+	default:
+		return fmt.Errorf("unsupported membership operation type %q", operation.Type)
+	}
+}
+
+func (n *Node) reconcileJoinOperation(ctx context.Context, operation MembershipOperation) error {
+	if !operation.Capabilities.SupportsGate(n.Metadata().CapabilityGate, false) {
+		return fmt.Errorf("joining node %q no longer satisfies the active capability gate", operation.Member.NodeID)
+	}
+	suffrage, present, err := n.raftServerSuffrage(operation.Member.NodeID)
+	if err != nil {
+		return err
+	}
+	if !present {
+		if err := n.raftAddNonvoter(ctx, operation.Member); err != nil {
+			return err
+		}
+		if err := n.updateMembershipOperation(ctx, &operation, MembershipPhaseNonVoter); err != nil {
+			return err
+		}
+		suffrage = raft.Nonvoter
+	}
+	if suffrage == raft.Nonvoter {
+		if err := n.waitForJoiningNodeCatchUp(ctx, operation.Member); err != nil {
+			return err
+		}
+		if err := n.updateMembershipOperation(ctx, &operation, MembershipPhaseCaughtUp); err != nil {
+			return err
+		}
+		if err := n.raftAddVoter(ctx, operation.Member); err != nil {
+			return err
+		}
+	}
+	if err := n.updateMembershipOperation(ctx, &operation, MembershipPhaseVoter); err != nil {
+		return err
+	}
+	members := n.committedMembers()
+	members[operation.Member.NodeID] = operation.Member
+	operation.Phase = MembershipPhaseCompleted
+	operation.UpdatedAt = time.Now().UTC()
+	state := n.Metadata()
+	_, err = n.PutMetadataBatch(ctx, operation.ID+"/completed", map[string]any{
+		"cluster/members": members, membershipOperationMetadataKey: operation,
+	}, state.Revision)
+	return err
+}
+
+func (n *Node) reconcileRemoveOperation(ctx context.Context, operation MembershipOperation) error {
+	_, present, err := n.raftServerSuffrage(operation.Member.NodeID)
+	if err != nil {
+		return err
+	}
+	if present {
+		if err := n.raftRemoveServer(ctx, operation.Member.NodeID); err != nil {
+			return err
+		}
+	}
+	if err := n.updateMembershipOperation(ctx, &operation, MembershipPhaseRemoved); err != nil {
+		return err
+	}
+	n.removePendingMember(operation.Member.NodeID)
+	n.refreshPeerRegistry()
+	members := n.committedMembers()
+	delete(members, operation.Member.NodeID)
+	operation.Phase = MembershipPhaseCompleted
+	operation.UpdatedAt = time.Now().UTC()
+	state := n.Metadata()
+	_, err = n.PutMetadataBatch(ctx, operation.ID+"/completed", map[string]any{
+		"cluster/members": members, membershipOperationMetadataKey: operation,
+	}, state.Revision)
+	return err
+}
+
+func (n *Node) updateMembershipOperation(ctx context.Context, operation *MembershipOperation, phase string) error {
+	if operation.Phase == phase {
+		return nil
+	}
+	operation.Phase = phase
+	operation.UpdatedAt = time.Now().UTC()
+	state := n.Metadata()
+	_, err := n.PutMetadata(ctx, operation.ID+"/"+phase, membershipOperationMetadataKey, *operation, state.Revision)
+	return err
+}
+
+func (n *Node) raftServerSuffrage(nodeID string) (raft.ServerSuffrage, bool, error) {
+	n.mu.RLock()
+	r := n.raft
+	n.mu.RUnlock()
+	if r == nil {
+		return 0, false, ErrNodeNotStarted
+	}
+	future := r.GetConfiguration()
+	if err := future.Error(); err != nil {
+		return 0, false, err
+	}
+	for _, server := range future.Configuration().Servers {
+		if server.ID == raft.ServerID(nodeID) {
+			return server.Suffrage, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+func (n *Node) raftAddNonvoter(ctx context.Context, member Member) error {
+	return n.runConfigurationChange(ctx, func(r *raft.Raft) raft.IndexFuture {
+		return r.AddNonvoter(raft.ServerID(member.NodeID), raft.ServerAddress(member.Addr), 0, 0)
+	})
+}
+
+func (n *Node) raftAddVoter(ctx context.Context, member Member) error {
+	return n.runConfigurationChange(ctx, func(r *raft.Raft) raft.IndexFuture {
+		return r.AddVoter(raft.ServerID(member.NodeID), raft.ServerAddress(member.Addr), 0, 0)
+	})
+}
+
+func (n *Node) raftRemoveServer(ctx context.Context, nodeID string) error {
+	return n.runConfigurationChange(ctx, func(r *raft.Raft) raft.IndexFuture {
+		return r.RemoveServer(raft.ServerID(nodeID), 0, 0)
+	})
+}
+
+func (n *Node) runConfigurationChange(ctx context.Context, start func(*raft.Raft) raft.IndexFuture) error {
+	n.configurationMu.Lock()
+	n.mu.RLock()
+	r := n.raft
+	n.mu.RUnlock()
+	if r == nil {
+		n.configurationMu.Unlock()
+		return ErrNodeNotStarted
+	}
+	done := make(chan error, 1)
+	go func() { done <- start(r).Error() }()
+	select {
+	case <-ctx.Done():
+		// Raft configuration futures cannot be canceled. Hold the serialization
+		// lock until the in-flight future terminates after this caller returns.
+		go func() {
+			<-done
+			n.configurationMu.Unlock()
+		}()
+		return ctx.Err()
+	case err := <-done:
+		n.configurationMu.Unlock()
+		return err
+	}
+}
+
+func (n *Node) waitForJoiningNodeCatchUp(ctx context.Context, member Member) error {
+	n.mu.RLock()
+	r := n.raft
+	n.mu.RUnlock()
+	if r == nil {
+		return ErrNodeNotStarted
+	}
+	if err := r.Barrier(time.Duration(n.cfg.MaxQuorumVerificationAge)).Error(); err != nil {
+		return err
+	}
+	target := parseUint(r.Stats()["commit_index"])
+	client, err := n.internalHTTPClient()
+	if err != nil {
+		return err
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if !n.HasBusinessLeadership() {
+			return ErrNotBusinessLeader
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(member.InternalAPIURL, "/")+"/internal/v1/status", nil)
+		if err == nil {
+			if resp, requestErr := client.Do(req); requestErr == nil {
+				var status Status
+				decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&status)
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK && decodeErr == nil && status.AppliedIndex >= target {
+					return nil
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func (n *Node) TransferLeadership(ctx context.Context, nodeID string) error {
@@ -860,8 +1410,30 @@ func (n *Node) committedMembers() map[string]Member {
 	return members
 }
 
+func (n *Node) addPendingMember(member Member) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.pendingMembers[member.NodeID] = member
+}
+
+func (n *Node) removePendingMember(nodeID string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	delete(n.pendingMembers, nodeID)
+}
+
 func (n *Node) refreshPeerRegistry() {
 	members := n.committedMembers()
+	if operation, ok, err := n.membershipOperation(); err == nil && ok && operation.Phase != MembershipPhaseCompleted {
+		if operation.Type != MembershipOperationRemove || operation.Phase != MembershipPhaseRemoved {
+			members[operation.Member.NodeID] = operation.Member
+		}
+	}
+	n.mu.RLock()
+	for nodeID, member := range n.pendingMembers {
+		members[nodeID] = member
+	}
+	n.mu.RUnlock()
 	list := make([]Member, 0, len(members))
 	for _, member := range members {
 		list = append(list, member)
@@ -1155,6 +1727,9 @@ func (n *Node) checkLocalBusinessLeadership(now time.Time, r *raft.Raft, fsm *me
 		return ErrNotBusinessLeader
 	}
 	state := fsm.State()
+	if !SupportedNodeCapabilities().SupportsGate(state.CapabilityGate, true) {
+		return ErrNotBusinessLeader
+	}
 	stats := r.Stats()
 	if state.LeaderOwner != n.cfg.NodeID || state.LeaderEpoch == 0 || state.LastLeadershipTerm != parseUint(stats["term"]) {
 		return ErrNotBusinessLeader
@@ -1219,6 +1794,11 @@ func (n *Node) updateStatus(role string, leaderID raft.ServerID, leaderAddr raft
 	n.status.CommittedGeneration = Generation{}
 	n.status.CommittedGenerationIndex = state.ActiveSnapshotIndex
 	n.status.AvailableGenerations = availableGenerations
+	n.status.ProtocolVersion = CurrentProtocolVersion
+	n.status.CommandVersion = CurrentCommandVersion
+	n.status.Capabilities = SupportedNodeCapabilities()
+	n.status.ActiveCapabilityGate = normalizeCapabilityGate(state.CapabilityGate)
+	n.status.LeaderEligible = SupportedNodeCapabilities().SupportsGate(state.CapabilityGate, true)
 	if manifest, ok := state.Snapshots[state.ActiveSnapshot]; ok {
 		n.status.CommittedGeneration = manifest.Generation
 	}
@@ -1239,7 +1819,7 @@ func (n *Node) updateStatus(role string, leaderID raft.ServerID, leaderAddr raft
 	case RoleFollower:
 		transportReady = leaderID != "" && contact >= 0 && contact <= time.Duration(n.cfg.MaxLeaderContactAge)
 	}
-	n.status.Ready = transportReady && applicationReady
+	n.status.Ready = transportReady && applicationReady && n.status.LeaderEligible
 	n.status.Readiness = ReadinessNotReady
 	if n.status.Ready {
 		n.status.Readiness = ReadinessReady
@@ -1254,6 +1834,20 @@ func (n *Node) updateStatus(role string, leaderID raft.ServerID, leaderAddr raft
 		}
 	}
 	n.status.Reason = reason
+}
+
+func waitContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func containsGeneration(generations []Generation, wanted Generation) bool {
@@ -1276,6 +1870,9 @@ func (n *Node) Metadata() MetadataState {
 }
 
 func (n *Node) Members() ([]MemberStatus, error) {
+	if n.isUnjoined() {
+		return []MemberStatus{{NodeID: n.cfg.NodeID, Address: n.cfg.RaftAdvertiseAddr, Suffrage: "unjoined"}}, nil
+	}
 	n.mu.RLock()
 	r := n.raft
 	n.mu.RUnlock()

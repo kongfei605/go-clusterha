@@ -40,6 +40,59 @@ func TestMetadataBatchApplyIsAtomicOnValidationFailure(t *testing.T) {
 	}
 }
 
+func TestMetadataFSMRejectsUnsupportedCommandVersion(t *testing.T) {
+	fsm := newMetadataFSM("cluster")
+	result := fsm.Apply(&raft.Log{Index: 1, Data: mustJSON(t, Command{
+		ID: "future", Type: CommandAcquireLeadership, ProtocolVersion: CurrentProtocolVersion + 1,
+		CommandVersion: CurrentCommandVersion, CreatedAt: time.Unix(0, 0).UTC(),
+	})}).(applyResult)
+	if result.Error == "" {
+		t.Fatal("expected unsupported protocol version to fail")
+	}
+	if fsm.State().Revision != 0 {
+		t.Fatal("unsupported command must not mutate state")
+	}
+}
+
+func TestMetadataFSMLegacyZeroVersionNeverTracksCurrentVersion(t *testing.T) {
+	fsm := newMetadataFSM("cluster")
+	fsm.capabilities.Protocol.Max = 2
+	fsm.capabilities.Command.Max = 2
+	result := fsm.Apply(&raft.Log{Index: 1, Data: mustJSON(t, Command{
+		ID: "legacy-zero", Type: CommandAcquireLeadership,
+		Payload: mustJSON(t, acquireLeadershipPayload{NodeID: "node-a", Term: 1}), CreatedAt: time.Unix(0, 0).UTC(),
+	})}).(applyResult)
+	if result.Error != "" {
+		t.Fatalf("legacy zero-version command failed: %s", result.Error)
+	}
+	result = fsm.Apply(&raft.Log{Index: 2, Data: mustJSON(t, Command{
+		ID: "inactive-v2", Type: CommandAcquireLeadership, ProtocolVersion: 2, CommandVersion: 2,
+		Payload: mustJSON(t, acquireLeadershipPayload{NodeID: "node-a", Term: 2}), CreatedAt: time.Unix(0, 0).UTC(),
+	})}).(applyResult)
+	if result.Error == "" {
+		t.Fatal("supported but inactive v2 command must be rejected")
+	}
+}
+
+func TestMetadataFSMRejectsManifestOutsideCapabilityGate(t *testing.T) {
+	fsm := newMetadataFSM("cluster")
+	fsm.state.LeaderEpoch = 1
+	fsm.state.LeaderOwner = "node-a"
+	manifest := Manifest{
+		SchemaVersion: 2,
+		Generation:    Generation{ClusterID: "cluster", LeaderEpoch: 1, Sequence: 1},
+		Datasets:      map[string]DatasetRef{"wan": {Name: "wan", SchemaVersion: 1}},
+	}
+	manifest.Generation.ManifestHash, _ = ComputeManifestHash(manifest)
+	result := fsm.Apply(&raft.Log{Index: 1, Data: mustJSON(t, Command{
+		ID: "future-manifest", Type: CommandCommitSnapshot, ProtocolVersion: 1, CommandVersion: 1, LeaderEpoch: 1,
+		Payload: mustJSON(t, commitSnapshotPayload{Manifest: manifest}), CreatedAt: time.Unix(0, 0).UTC(),
+	})}).(applyResult)
+	if result.Error == "" || fsm.State().ActiveSnapshot != "" {
+		t.Fatalf("future manifest was accepted: result=%#v", result)
+	}
+}
+
 func mustJSON(t *testing.T, value any) []byte {
 	t.Helper()
 	data, err := json.Marshal(value)

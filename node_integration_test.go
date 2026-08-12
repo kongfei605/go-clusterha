@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/raft"
 )
 
 func TestThreeNodeElectionReplicationAndFailover(t *testing.T) {
@@ -151,6 +153,101 @@ func TestThreeNodeElectionReplicationAndFailover(t *testing.T) {
 			}
 		}
 		return true
+	})
+	joinNodeID := "node-d"
+	joinRaftAddress := freeAddress(t)
+	joinInternalAddress := freeAddress(t)
+	joinCertFile, joinKeyFile := createNodeCertificate(t, caCert, caKey, joinNodeID, serverName)
+	joinCfg := Config{
+		Enabled: true, ClusterID: "integration", NodeID: joinNodeID,
+		RaftBindAddr: joinRaftAddress, RaftAdvertiseAddr: joinRaftAddress,
+		InternalAPIBindAddr: joinInternalAddress, InternalAPIAdvertiseAddr: "https://" + joinInternalAddress,
+		DataDir: t.TempDir(), BootstrapExpect: 3, JoinExisting: true, InitialMembers: initialMembers,
+		MaxLeaderContactAge: Duration(2 * time.Second), MaxQuorumVerificationAge: Duration(time.Second),
+		SnapshotDurablePolicy: SnapshotDurablePolicyVoterQuorum,
+		InternalTLS:           TLSConfig{Enabled: true, CAFile: caFile, CertFile: joinCertFile, KeyFile: joinKeyFile, ServerName: serverName},
+	}
+	joinNode, err := NewNode(joinCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := joinNode.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	nodes = append(nodes, joinNode)
+	joinMember := Member{NodeID: joinNodeID, Addr: joinRaftAddress, InternalAPIURL: "https://" + joinInternalAddress}
+	leader.addPendingMember(joinMember)
+	leader.refreshPeerRegistry()
+	joinCapabilities, err := leader.prepareJoiningMember(context.Background(), joinMember)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinOperation := MembershipOperation{ID: "join/node-d/recovery-window", Type: MembershipOperationJoin,
+		Phase: MembershipPhasePrepared, Member: joinMember, Capabilities: joinCapabilities,
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if err := leader.beginMembershipOperation(context.Background(), joinOperation); err != nil {
+		t.Fatal(err)
+	}
+	if _, present, err := leader.raftServerSuffrage(joinNodeID); err != nil || present {
+		t.Fatalf("prepared join unexpectedly changed Raft configuration: present=%t err=%v", present, err)
+	}
+	if err := leader.JoinVoter(context.Background(), joinMember); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		members, err := leader.Members()
+		if err != nil {
+			return false
+		}
+		for _, member := range members {
+			if member.NodeID == joinNodeID && member.Suffrage == raft.Voter.String() {
+				return true
+			}
+		}
+		return false
+	})
+	operation, ok, err := leader.membershipOperation()
+	if err != nil || !ok || operation.Phase != MembershipPhaseCompleted {
+		t.Fatalf("join operation was not completed: operation=%#v ok=%t err=%v", operation, ok, err)
+	}
+	// Simulate a leader crash after Raft promoted the voter but before the FSM
+	// recorded completion. Reconciliation must derive the next step from Raft.
+	operation.ID += "/recovery"
+	operation.Phase = MembershipPhasePrepared
+	operation.UpdatedAt = time.Now().UTC()
+	state = leader.Metadata()
+	if _, err := leader.PutMetadata(context.Background(), operation.ID+"/test-recovery", membershipOperationMetadataKey, operation, state.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.reconcileMembershipOperation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	operation, ok, err = leader.membershipOperation()
+	if err != nil || !ok || operation.Phase != MembershipPhaseCompleted {
+		t.Fatalf("join recovery did not complete: operation=%#v ok=%t err=%v", operation, ok, err)
+	}
+	replacedNodeID := ""
+	for _, nodeID := range nodeIDs {
+		if nodeID != leader.NodeID() {
+			replacedNodeID = nodeID
+			break
+		}
+	}
+	if err := leader.RemoveServer(context.Background(), replacedNodeID); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		members, err := leader.Members()
+		if err != nil {
+			return false
+		}
+		for _, member := range members {
+			if member.NodeID == replacedNodeID {
+				return false
+			}
+		}
+		_, trusted := leader.peers.Member(replacedNodeID)
+		return !trusted
 	})
 
 	oldEpoch := leader.Status().LeaderEpoch

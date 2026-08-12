@@ -2,7 +2,6 @@ package clusterha
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 )
@@ -73,7 +72,7 @@ func TestNodeStartsNotReadyUntilRuntimeConnects(t *testing.T) {
 	}
 }
 
-func TestJoinExistingRefusesToBootstrapEmptyDirectory(t *testing.T) {
+func TestJoinExistingStartsUnjoinedWithoutBootstrapping(t *testing.T) {
 	cfg := validEnabledConfig()
 	caCert, caKey, caFile := createTestCA(t)
 	certFile, keyFile := createNodeCertificate(t, caCert, caKey, cfg.NodeID, "clusterha.test")
@@ -90,8 +89,20 @@ func TestJoinExistingRefusesToBootstrapEmptyDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = node.Start(t.Context())
-	if err == nil || !strings.Contains(err.Error(), "join_existing=true") {
-		t.Fatalf("err=%v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close()
+	status := node.Status()
+	if status.Ready || status.Reason != "node is waiting for cluster join" {
+		t.Fatalf("status=%#v", status)
+	}
+	members, err := node.Members()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 1 || members[0].Suffrage != "unjoined" {
+		t.Fatalf("members=%#v", members)
 	}
 }
 

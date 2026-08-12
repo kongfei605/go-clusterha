@@ -204,3 +204,14 @@ func TestComputeManifestHashIgnoresExistingManifestHash(t *testing.T) {
 		t.Fatalf("manifest hash changed: %q != %q", first, second)
 	}
 }
+
+func TestManifestCapabilityTreatsZeroSchemaAsLegacyV1(t *testing.T) {
+	manifest := Manifest{Datasets: map[string]DatasetRef{"wan": {Name: "wan"}}}
+	if err := validateManifestCapability(manifest, LegacyCapabilityGate()); err != nil {
+		t.Fatalf("legacy zero schema rejected: %v", err)
+	}
+	manifest.Datasets["wan"] = DatasetRef{Name: "wan", SchemaVersion: 2}
+	if err := validateManifestCapability(manifest, LegacyCapabilityGate()); err == nil {
+		t.Fatal("inactive dataset schema was accepted")
+	}
+}

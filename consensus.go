@@ -13,13 +13,16 @@ import (
 )
 
 const (
-	CommandAcquireLeadership = "acquire_leadership"
-	CommandPutMetadata       = "put_metadata"
-	CommandPutMetadataBatch  = "put_metadata_batch"
-	CommandCommitSnapshot    = "commit_snapshot"
+	CommandAcquireLeadership    = "acquire_leadership"
+	CommandPutMetadata          = "put_metadata"
+	CommandPutMetadataBatch     = "put_metadata_batch"
+	CommandCommitSnapshot       = "commit_snapshot"
+	CommandActivateCapabilities = "activate_capabilities"
 )
 
 type Command struct {
+	ProtocolVersion  uint32          `json:"protocol_version"`
+	CommandVersion   uint32          `json:"command_version"`
 	ID               string          `json:"command_id"`
 	Type             string          `json:"command_type"`
 	ExpectedRevision *uint64         `json:"expected_revision,omitempty"`
@@ -38,6 +41,7 @@ type MetadataState struct {
 	Snapshots           map[string]Manifest        `json:"snapshots,omitempty"`
 	ActiveSnapshot      string                     `json:"active_snapshot,omitempty"`
 	ActiveSnapshotIndex uint64                     `json:"active_snapshot_index"`
+	CapabilityGate      CapabilityGate             `json:"capability_gate"`
 	AppliedCommands     map[string]AppliedCommand  `json:"applied_commands,omitempty"`
 }
 
@@ -51,6 +55,7 @@ func (s *MetadataState) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*s = MetadataState(raw.metadataState)
+	s.CapabilityGate = normalizeCapabilityGate(s.CapabilityGate)
 	s.AppliedCommands = make(map[string]AppliedCommand)
 	if len(raw.AppliedCommands) == 0 || string(raw.AppliedCommands) == "null" {
 		return nil
@@ -91,6 +96,10 @@ type commitSnapshotPayload struct {
 	Manifest Manifest `json:"manifest"`
 }
 
+type activateCapabilitiesPayload struct {
+	Gate CapabilityGate `json:"gate"`
+}
+
 type applyResult struct {
 	Revision    uint64 `json:"revision"`
 	LeaderEpoch uint64 `json:"leader_epoch"`
@@ -98,15 +107,17 @@ type applyResult struct {
 }
 
 type metadataFSM struct {
-	mu    sync.RWMutex
-	state MetadataState
+	mu           sync.RWMutex
+	state        MetadataState
+	capabilities NodeCapabilities
 }
 
 func newMetadataFSM(clusterID string) *metadataFSM {
-	return &metadataFSM{state: MetadataState{
+	return &metadataFSM{capabilities: SupportedNodeCapabilities(), state: MetadataState{
 		ClusterID:       clusterID,
 		Values:          make(map[string]json.RawMessage),
 		Snapshots:       make(map[string]Manifest),
+		CapabilityGate:  LegacyCapabilityGate(),
 		AppliedCommands: make(map[string]AppliedCommand),
 	}}
 }
@@ -119,9 +130,24 @@ func (f *metadataFSM) Apply(log *raft.Log) any {
 	if command.ID == "" {
 		return applyResult{Error: "command_id is required"}
 	}
+	if command.ProtocolVersion == 0 {
+		command.ProtocolVersion = LegacyProtocolVersion
+	}
+	if command.CommandVersion == 0 {
+		command.CommandVersion = LegacyCommandVersion
+	}
+	if !f.capabilities.Protocol.Supports(command.ProtocolVersion) || !f.capabilities.Command.Supports(command.CommandVersion) {
+		return applyResult{Error: fmt.Sprintf("unsupported command version protocol=%d command=%d", command.ProtocolVersion, command.CommandVersion)}
+	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	gate := normalizeCapabilityGate(f.state.CapabilityGate)
+	if command.ProtocolVersion != gate.ProtocolVersion || command.CommandVersion != gate.CommandVersion {
+		return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch,
+			Error: fmt.Sprintf("command version protocol=%d command=%d is not active; active protocol=%d command=%d",
+				command.ProtocolVersion, command.CommandVersion, gate.ProtocolVersion, gate.CommandVersion)}
+	}
 	digest, err := commandDigest(command)
 	if err != nil {
 		return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: err.Error()}
@@ -202,6 +228,9 @@ func (f *metadataFSM) Apply(log *raft.Log) any {
 		if payload.Manifest.Generation.LeaderEpoch != f.state.LeaderEpoch {
 			return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: "snapshot leader epoch is not current"}
 		}
+		if err := validateManifestCapability(payload.Manifest, gate); err != nil {
+			return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: err.Error()}
+		}
 		hash, err := ComputeManifestHash(payload.Manifest)
 		if err != nil {
 			return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: err.Error()}
@@ -215,6 +244,22 @@ func (f *metadataFSM) Apply(log *raft.Log) any {
 		f.state.Snapshots[hash] = payload.Manifest
 		f.state.ActiveSnapshot = hash
 		f.state.ActiveSnapshotIndex = log.Index
+	case CommandActivateCapabilities:
+		if command.LeaderEpoch != f.state.LeaderEpoch || f.state.LeaderOwner == "" {
+			return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: "leader epoch is not current"}
+		}
+		var payload activateCapabilitiesPayload
+		if err := json.Unmarshal(command.Payload, &payload); err != nil {
+			return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: fmt.Sprintf("decode capability gate payload: %v", err)}
+		}
+		payload.Gate = normalizeCapabilityGate(payload.Gate)
+		if err := validateCapabilityGate(payload.Gate); err != nil {
+			return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: err.Error()}
+		}
+		if !f.capabilities.SupportsGate(payload.Gate, false) {
+			return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: "local node does not support requested capability gate"}
+		}
+		f.state.CapabilityGate = payload.Gate
 	default:
 		return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: fmt.Sprintf("unsupported command type %q", command.Type)}
 	}
@@ -235,11 +280,15 @@ func commandDigest(command Command) (string, error) {
 		Type             string  `json:"command_type"`
 		ExpectedRevision *uint64 `json:"expected_revision,omitempty"`
 		LeaderEpoch      uint64  `json:"leader_epoch"`
+		ProtocolVersion  uint32  `json:"protocol_version"`
+		CommandVersion   uint32  `json:"command_version"`
 		Payload          any     `json:"payload,omitempty"`
 	}{
 		Type:             command.Type,
 		ExpectedRevision: command.ExpectedRevision,
 		LeaderEpoch:      command.LeaderEpoch,
+		ProtocolVersion:  command.ProtocolVersion,
+		CommandVersion:   command.CommandVersion,
 		Payload:          payload,
 	}
 	data, err := json.Marshal(canonical)
@@ -273,6 +322,7 @@ func (f *metadataFSM) Restore(reader io.ReadCloser) error {
 	if state.AppliedCommands == nil {
 		state.AppliedCommands = make(map[string]AppliedCommand)
 	}
+	state.CapabilityGate = normalizeCapabilityGate(state.CapabilityGate)
 	f.mu.Lock()
 	f.state = state
 	f.mu.Unlock()
@@ -301,6 +351,7 @@ func (*metadataSnapshot) Release() {}
 
 func cloneMetadataState(state MetadataState) MetadataState {
 	copyState := state
+	copyState.CapabilityGate = normalizeCapabilityGate(state.CapabilityGate)
 	copyState.Values = make(map[string]json.RawMessage, len(state.Values))
 	for key, value := range state.Values {
 		copyState.Values[key] = append(json.RawMessage(nil), value...)
