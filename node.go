@@ -705,6 +705,9 @@ func (n *Node) PublishSnapshot(ctx context.Context, commandID string, manifest M
 	if err := validateManifestCapability(manifest, n.Metadata().CapabilityGate); err != nil {
 		return 0, err
 	}
+	if err := ValidateManifest(manifest); err != nil {
+		return 0, err
+	}
 	n.retainStagingBlobs(manifest)
 	defer n.releaseStagingBlobs(manifest)
 	for hash, reader := range blobs {

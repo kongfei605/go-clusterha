@@ -106,6 +106,63 @@ func validateManifestCapability(manifest Manifest, gate CapabilityGate) error {
 	return nil
 }
 
+// ValidateManifest validates the storage shape of every dataset before any
+// snapshot blobs are replicated. Capability compatibility is validated
+// separately because it is controlled by the active cluster gate.
+func ValidateManifest(manifest Manifest) error {
+	for name, dataset := range manifest.Datasets {
+		if name == "" {
+			return fmt.Errorf("dataset name is empty")
+		}
+		if dataset.Name != name {
+			return fmt.Errorf("dataset %q embeds mismatched name %q", name, dataset.Name)
+		}
+		if dataset.RecordCount < 0 || dataset.UncompressedBytes < 0 {
+			return fmt.Errorf("dataset %q has negative record or byte count", name)
+		}
+		if dataset.PreviousBlobHash != "" {
+			if _, err := normalizeSHA256Hash(dataset.PreviousBlobHash); err != nil {
+				return fmt.Errorf("dataset %q previous_blob_hash: %w", name, err)
+			}
+		}
+		hasBlob := dataset.BlobHash != ""
+		hasShards := len(dataset.Shards) > 0
+		if hasBlob == hasShards {
+			return fmt.Errorf("dataset %q must contain exactly one of blob_hash or shards", name)
+		}
+		if hasBlob {
+			if _, err := normalizeSHA256Hash(dataset.BlobHash); err != nil {
+				return fmt.Errorf("dataset %q blob_hash: %w", name, err)
+			}
+			continue
+		}
+		seen := make(map[string]struct{}, len(dataset.Shards))
+		var records, uncompressedBytes int64
+		for index, shard := range dataset.Shards {
+			if shard.Key == "" {
+				return fmt.Errorf("dataset %q shard %d has empty key", name, index)
+			}
+			if _, exists := seen[shard.Key]; exists {
+				return fmt.Errorf("dataset %q contains duplicate shard key %q", name, shard.Key)
+			}
+			seen[shard.Key] = struct{}{}
+			if _, err := normalizeSHA256Hash(shard.BlobHash); err != nil {
+				return fmt.Errorf("dataset %q shard %q blob_hash: %w", name, shard.Key, err)
+			}
+			if shard.RecordCount < 0 || shard.UncompressedBytes < 0 {
+				return fmt.Errorf("dataset %q shard %q has negative record or byte count", name, shard.Key)
+			}
+			records += shard.RecordCount
+			uncompressedBytes += shard.UncompressedBytes
+		}
+		if records != dataset.RecordCount || uncompressedBytes != dataset.UncompressedBytes {
+			return fmt.Errorf("dataset %q shard totals records=%d bytes=%d do not match dataset records=%d bytes=%d",
+				name, records, uncompressedBytes, dataset.RecordCount, dataset.UncompressedBytes)
+		}
+	}
+	return nil
+}
+
 func cloneManifest(manifest Manifest) Manifest {
 	copyManifest := manifest
 	copyManifest.Datasets = make(map[string]DatasetRef, len(manifest.Datasets))

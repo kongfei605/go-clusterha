@@ -229,3 +229,40 @@ func TestCloneManifestCopiesShardMetadata(t *testing.T) {
 		t.Fatalf("dataset shard hashes=%v", hashes)
 	}
 }
+
+func TestValidateManifestAcceptsConsistentShards(t *testing.T) {
+	hashA := HashPrefixSHA256 + strings.Repeat("a", 64)
+	hashB := HashPrefixSHA256 + strings.Repeat("b", 64)
+	manifest := Manifest{Datasets: map[string]DatasetRef{"metrics/wan": {
+		Name: "metrics/wan", RecordCount: 3, UncompressedBytes: 30,
+		Shards: []DatasetShardRef{{Key: "a", BlobHash: hashA, RecordCount: 1, UncompressedBytes: 10},
+			{Key: "b", BlobHash: hashB, RecordCount: 2, UncompressedBytes: 20}},
+	}}}
+	if err := ValidateManifest(manifest); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateManifestRejectsAmbiguousOrMalformedShards(t *testing.T) {
+	hash := HashPrefixSHA256 + strings.Repeat("a", 64)
+	tests := []struct {
+		name string
+		ref  DatasetRef
+	}{
+		{name: "both blob and shards", ref: DatasetRef{Name: "wan", BlobHash: hash,
+			Shards: []DatasetShardRef{{Key: "a", BlobHash: hash}}}},
+		{name: "neither blob nor shards", ref: DatasetRef{Name: "wan"}},
+		{name: "duplicate shard keys", ref: DatasetRef{Name: "wan", Shards: []DatasetShardRef{
+			{Key: "a", BlobHash: hash}, {Key: "a", BlobHash: hash}}}},
+		{name: "bad shard hash", ref: DatasetRef{Name: "wan", Shards: []DatasetShardRef{{Key: "a", BlobHash: "sha256:a"}}}},
+		{name: "wrong aggregate", ref: DatasetRef{Name: "wan", RecordCount: 2,
+			Shards: []DatasetShardRef{{Key: "a", BlobHash: hash, RecordCount: 1}}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := ValidateManifest(Manifest{Datasets: map[string]DatasetRef{"wan": test.ref}}); err == nil {
+				t.Fatal("malformed manifest was accepted")
+			}
+		})
+	}
+}
