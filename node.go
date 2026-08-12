@@ -575,9 +575,9 @@ func (n *Node) ActivateCapabilities(ctx context.Context, commandID string, gate 
 	if err := validateCapabilityGate(gate); err != nil {
 		return 0, err
 	}
-	if operation, ok, err := n.membershipOperation(); err != nil {
+	if operation, ok, err := n.activeMembershipOperation(); err != nil {
 		return 0, err
-	} else if ok && operation.Phase != MembershipPhaseCompleted {
+	} else if ok {
 		return 0, fmt.Errorf("cannot activate capabilities while membership operation %q for node %q is active", operation.Type, operation.Member.NodeID)
 	}
 	activeGate := n.Metadata().CapabilityGate
@@ -1214,6 +1214,14 @@ func (n *Node) membershipOperation() (MembershipOperation, bool, error) {
 	var operation MembershipOperation
 	if err := json.Unmarshal(raw, &operation); err != nil {
 		return MembershipOperation{}, false, fmt.Errorf("decode membership operation: %w", err)
+	}
+	return operation, true, nil
+}
+
+func (n *Node) activeMembershipOperation() (MembershipOperation, bool, error) {
+	operation, ok, err := n.membershipOperation()
+	if err != nil || !ok || operation.Phase == MembershipPhaseCompleted {
+		return operation, false, err
 	}
 	return operation, true, nil
 }

@@ -37,7 +37,7 @@ type compatProcess struct {
 	logs   bytes.Buffer
 }
 
-const compatOldSourceCommit = "1d1882273a13"
+const compatOldSourceCommit = "1d1882273a136b1b9242b3a446e5dd42159b969a"
 
 func TestNNPlusOneSourceCompatibility(t *testing.T) {
 	if testing.Short() {
@@ -45,6 +45,9 @@ func TestNNPlusOneSourceCompatibility(t *testing.T) {
 	}
 	if *compatChildMode {
 		t.Skip("parent test is disabled in child mode")
+	}
+	if os.Getenv("CLUSTERHA_RUN_SOURCE_COMPAT") != "1" {
+		t.Skip("set CLUSTERHA_RUN_SOURCE_COMPAT=1 to run source compatibility test that requires local git history")
 	}
 
 	binDir := t.TempDir()

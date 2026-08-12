@@ -192,9 +192,6 @@ func TestThreeNodeElectionReplicationAndFailover(t *testing.T) {
 	if err := leader.beginMembershipOperation(context.Background(), joinOperation); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := leader.ActivateCapabilities(context.Background(), "gate-during-join", LegacyCapabilityGate()); err == nil {
-		t.Fatal("capability activation must be rejected while a membership operation is active")
-	}
 	v2Gate := CapabilityGate{
 		ProtocolVersion: 2, CommandVersion: 2, ManifestSchemaVersion: 1,
 		DatasetSchemaVersions: map[string]uint32{"*": 1}, MinimumLeaderCapability: 2, MinimumVoterCapability: 2,

@@ -57,6 +57,24 @@ func TestValidateCapabilityActivationVotersRequiresLeaderEligibleVoter(t *testin
 	}
 }
 
+func TestActiveMembershipOperationIgnoresCompletedOperation(t *testing.T) {
+	fsm := newMetadataFSM("cluster")
+	node := &Node{cfg: Config{ClusterID: "cluster"}, fsm: fsm}
+	operation := MembershipOperation{ID: "join/node-d/test", Type: MembershipOperationJoin,
+		Phase: MembershipPhasePrepared, Member: Member{NodeID: "node-d"}}
+	data, _ := json.Marshal(operation)
+	fsm.state.Values[membershipOperationMetadataKey] = data
+	if active, ok, err := node.activeMembershipOperation(); err != nil || !ok || active.Member.NodeID != "node-d" {
+		t.Fatalf("active operation mismatch: operation=%#v ok=%t err=%v", active, ok, err)
+	}
+	operation.Phase = MembershipPhaseCompleted
+	data, _ = json.Marshal(operation)
+	fsm.state.Values[membershipOperationMetadataKey] = data
+	if active, ok, err := node.activeMembershipOperation(); err != nil || ok {
+		t.Fatalf("completed operation considered active: operation=%#v ok=%t err=%v", active, ok, err)
+	}
+}
+
 func TestLeaderStatusCanServeGenerationRequiresAvailableGeneration(t *testing.T) {
 	generation := Generation{ClusterID: "cluster", LeaderEpoch: 1, Sequence: 2, ManifestHash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	status := Status{CommittedGeneration: generation}
