@@ -36,6 +36,8 @@ type compatChildConfig struct {
 type compatProcess struct {
 	nodeID string
 	level  string
+	binary string
+	config compatChildConfig
 	admin  string
 	cmd    *exec.Cmd
 	logs   bytes.Buffer
@@ -131,6 +133,17 @@ func runCompatClusterScenario(t *testing.T, oldBinary, newBinary string) {
 		if got := compatReadDataset(t, proc, nGeneration); got != "dataset-written-by-n" {
 			t.Fatalf("N+1 node %s read N dataset %q", proc.nodeID, got)
 		}
+	}
+	restartTarget := processes[0]
+	if err := compatForceRaftSnapshot(restartTarget); err != nil {
+		t.Fatalf("force N+1 raft snapshot before restart: %v", err)
+	}
+	stopCompatChild(t, restartTarget)
+	restartCompatChild(t, restartTarget)
+	waitForCompatAdmin(t, restartTarget, 10*time.Second)
+	_ = waitForCompatLeader(t, processes, 30*time.Second)
+	if got := compatReadDataset(t, restartTarget, nGeneration); got != "dataset-written-by-n" {
+		t.Fatalf("restarted N+1 node read N dataset %q", got)
 	}
 
 	gate := CapabilityGate{
@@ -293,6 +306,20 @@ func TestClusterHACompatChildProcess(t *testing.T) {
 		}
 		writeCompatJSON(w, http.StatusOK, map[string]string{"value": string(data)})
 	})
+	mux.HandleFunc("/raft-snapshot", func(w http.ResponseWriter, _ *http.Request) {
+		node.mu.RLock()
+		raftNode := node.raft
+		node.mu.RUnlock()
+		if raftNode == nil {
+			writeCompatError(w, http.StatusServiceUnavailable, ErrNodeNotStarted)
+			return
+		}
+		if err := raftNode.Snapshot().Error(); err != nil {
+			writeCompatError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeCompatJSON(w, http.StatusOK, map[string]bool{"snapshotted": true})
+	})
 
 	listener, err := net.Listen("tcp", cfg.AdminAddr)
 	if err != nil {
@@ -364,25 +391,36 @@ func buildCompatBinary(t *testing.T, sourceDir, dir, name, capabilityLevel strin
 
 func startCompatChild(t *testing.T, binary, level string, cfg compatChildConfig) *compatProcess {
 	t.Helper()
-	configPath := filepath.Join(t.TempDir(), cfg.Node.NodeID+".json")
-	data, err := json.Marshal(cfg)
+	proc := &compatProcess{nodeID: cfg.Node.NodeID, level: level, binary: binary, config: cfg, admin: "http://" + cfg.AdminAddr}
+	launchCompatChild(t, proc)
+	t.Cleanup(func() { stopCompatChild(t, proc) })
+	waitForCompatAdmin(t, proc, 10*time.Second)
+	return proc
+}
+
+func restartCompatChild(t *testing.T, proc *compatProcess) {
+	t.Helper()
+	launchCompatChild(t, proc)
+}
+
+func launchCompatChild(t *testing.T, proc *compatProcess) {
+	t.Helper()
+	configPath := filepath.Join(t.TempDir(), proc.nodeID+".json")
+	data, err := json.Marshal(proc.config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(configPath, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	proc := &compatProcess{nodeID: cfg.Node.NodeID, level: level, admin: "http://" + cfg.AdminAddr}
-	cmd := exec.Command(binary, "-test.run", "^TestClusterHACompatChildProcess$", "-clusterha-compat-child", "-clusterha-compat-config", configPath)
+	proc.logs.Reset()
+	cmd := exec.Command(proc.binary, "-test.run", "^TestClusterHACompatChildProcess$", "-clusterha-compat-child", "-clusterha-compat-config", configPath)
 	cmd.Stdout = &proc.logs
 	cmd.Stderr = &proc.logs
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	proc.cmd = cmd
-	t.Cleanup(func() { stopCompatChild(t, proc) })
-	waitForCompatAdmin(t, proc, 10*time.Second)
-	return proc
 }
 
 func stopCompatChild(t *testing.T, proc *compatProcess) {
@@ -398,6 +436,7 @@ func stopCompatChild(t *testing.T, proc *compatProcess) {
 		_ = proc.cmd.Process.Kill()
 		t.Fatalf("compat child %s did not exit; logs:\n%s", proc.nodeID, proc.logs.String())
 	case <-done:
+		proc.cmd = nil
 	}
 }
 
@@ -504,6 +543,11 @@ func compatActivateCapabilities(t *testing.T, proc *compatProcess, id string, ga
 func compatTransferLeadership(proc *compatProcess, nodeID string) error {
 	var response map[string]bool
 	return compatPostJSON(proc.admin+"/transfer?node="+url.QueryEscape(nodeID), map[string]any{}, &response)
+}
+
+func compatForceRaftSnapshot(proc *compatProcess) error {
+	var response map[string]bool
+	return compatPostJSON(proc.admin+"/raft-snapshot", map[string]any{}, &response)
 }
 
 func compatPublishDataset(proc *compatProcess, value string) (Generation, error) {
