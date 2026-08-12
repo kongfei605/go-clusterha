@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -189,8 +190,15 @@ func TestThreeNodeElectionReplicationAndFailover(t *testing.T) {
 	joinOperation := MembershipOperation{ID: "join/node-d/recovery-window", Type: MembershipOperationJoin,
 		Phase: MembershipPhasePrepared, Member: joinMember, Capabilities: joinCapabilities,
 		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	reconcileGate := make(chan struct{})
+	leader.setMembershipReconcileGateForTest(reconcileGate)
+	defer close(reconcileGate)
 	if err := leader.beginMembershipOperation(context.Background(), joinOperation); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := leader.ActivateCapabilities(context.Background(), "activate-during-membership", leader.Metadata().CapabilityGate); err == nil ||
+		!strings.Contains(err.Error(), "membership operation") {
+		t.Fatalf("capability activation during active membership operation err=%v", err)
 	}
 	v2Gate := CapabilityGate{
 		ProtocolVersion: 2, CommandVersion: 2, ManifestSchemaVersion: 1,
@@ -302,6 +310,16 @@ func testV2Capabilities() NodeCapabilities {
 		Command:         VersionRange{Min: 1, Max: 2},
 		ManifestSchema:  VersionRange{Min: 1, Max: 2},
 		DatasetSchema:   VersionRange{Min: 1, Max: 2},
+	}
+}
+
+func testV1Capabilities() NodeCapabilities {
+	return NodeCapabilities{
+		CapabilityLevel: 1,
+		Protocol:        VersionRange{Min: 1, Max: 1},
+		Command:         VersionRange{Min: 1, Max: 1},
+		ManifestSchema:  VersionRange{Min: 1, Max: 1},
+		DatasetSchema:   VersionRange{Min: 1, Max: 1},
 	}
 }
 

@@ -22,6 +22,10 @@ func TestNormalizeConfigDefaults(t *testing.T) {
 	if cfg.GenerationRetention != DefaultGenerationRetention {
 		t.Fatalf("GenerationRetention=%d", cfg.GenerationRetention)
 	}
+	if time.Duration(cfg.SnapshotPublishInterval) != DefaultSnapshotPublishInterval ||
+		time.Duration(cfg.SnapshotFreshnessMaxAge) != DefaultSnapshotFreshnessMaxAge {
+		t.Fatalf("snapshot defaults interval=%s freshness=%s", cfg.SnapshotPublishInterval, cfg.SnapshotFreshnessMaxAge)
+	}
 }
 
 func TestValidateConfigDisabledAllowsEmptyConfig(t *testing.T) {
@@ -41,6 +45,20 @@ func TestValidateConfigEnabledRequiresVoterQuorumAndMTLS(t *testing.T) {
 	cfg.InternalTLS.Enabled = false
 	if err := ValidateConfig(cfg); err == nil {
 		t.Fatal("expected internal mTLS validation error")
+	}
+}
+
+func TestValidateConfigRejectsUnsupportedReadConsistency(t *testing.T) {
+	cfg := validEnabledConfig()
+	cfg.ReadConsistency = "eventual"
+	if err := ValidateConfig(cfg); err == nil {
+		t.Fatal("unsupported read consistency was accepted")
+	}
+	cfg = validEnabledConfig()
+	cfg.SnapshotPublishRetryMin = Duration(time.Minute)
+	cfg.SnapshotPublishRetryMax = Duration(time.Second)
+	if err := ValidateConfig(cfg); err == nil {
+		t.Fatal("inverted snapshot retry bounds were accepted")
 	}
 }
 

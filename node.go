@@ -139,6 +139,8 @@ type Node struct {
 	blobPutSem       chan struct{}
 	configurationMu  sync.Mutex
 	membershipMu     sync.Mutex
+	membershipGateMu sync.RWMutex
+	membershipGate   <-chan struct{}
 	capabilities     NodeCapabilities
 }
 
@@ -329,10 +331,26 @@ func (n *Node) membershipMaintenance(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if n.HasBusinessLeadership() {
+				n.membershipGateMu.RLock()
+				gate := n.membershipGate
+				n.membershipGateMu.RUnlock()
+				if gate != nil {
+					select {
+					case <-ctx.Done():
+						return
+					case <-gate:
+					}
+				}
 				_ = n.reconcileMembershipOperation(ctx)
 			}
 		}
 	}
+}
+
+func (n *Node) setMembershipReconcileGateForTest(gate <-chan struct{}) {
+	n.membershipGateMu.Lock()
+	n.membershipGate = gate
+	n.membershipGateMu.Unlock()
 }
 
 func (n *Node) watchRaftLeadership(ctx context.Context) {
@@ -753,6 +771,9 @@ func (n *Node) OpenSnapshotDataset(name string) (io.ReadCloser, DatasetRef, erro
 	if store == nil {
 		return nil, DatasetRef{}, ErrNodeNotStarted
 	}
+	if len(ref.Shards) > 0 {
+		return nil, DatasetRef{}, fmt.Errorf("dataset %q is sharded", name)
+	}
 	file, err := store.Open(ref.BlobHash)
 	if err != nil {
 		return nil, DatasetRef{}, err
@@ -776,8 +797,36 @@ func (n *Node) OpenSnapshotDatasetAt(generation Generation, name string) (io.Rea
 	if store == nil {
 		return nil, DatasetRef{}, ErrNodeNotStarted
 	}
+	if len(ref.Shards) > 0 {
+		return nil, DatasetRef{}, fmt.Errorf("dataset %q is sharded", name)
+	}
 	file, err := store.Open(ref.BlobHash)
 	return file, ref, err
+}
+
+func (n *Node) OpenSnapshotDatasetShardAt(generation Generation, name, shardKey string) (io.ReadCloser, DatasetShardRef, error) {
+	manifest, ok := n.Snapshot(generation)
+	if !ok {
+		return nil, DatasetShardRef{}, os.ErrNotExist
+	}
+	ref, ok := manifest.Datasets[name]
+	if !ok {
+		return nil, DatasetShardRef{}, os.ErrNotExist
+	}
+	for _, shard := range ref.Shards {
+		if shard.Key != shardKey {
+			continue
+		}
+		n.mu.RLock()
+		store := n.blobStore
+		n.mu.RUnlock()
+		if store == nil {
+			return nil, DatasetShardRef{}, ErrNodeNotStarted
+		}
+		file, err := store.Open(shard.BlobHash)
+		return file, shard, err
+	}
+	return nil, DatasetShardRef{}, os.ErrNotExist
 }
 
 func (n *Node) ParseGeneration(value string) (Generation, error) {
@@ -875,19 +924,21 @@ func (n *Node) syncActiveSnapshot(ctx context.Context) {
 		return
 	}
 	for _, dataset := range manifest.Datasets {
-		n.mu.RLock()
-		store := n.blobStore
-		n.mu.RUnlock()
-		if store == nil || store.Verify(dataset.BlobHash) == nil {
-			continue
-		}
-		for _, server := range voters {
-			nodeID := string(server.ID)
-			if nodeID == n.cfg.NodeID {
+		for _, hash := range datasetBlobHashes(dataset) {
+			n.mu.RLock()
+			store := n.blobStore
+			n.mu.RUnlock()
+			if store == nil || store.Verify(hash) == nil {
 				continue
 			}
-			if err := n.pullBlobFromPeer(ctx, nodeID, dataset.BlobHash); err == nil {
-				break
+			for _, server := range voters {
+				nodeID := string(server.ID)
+				if nodeID == n.cfg.NodeID {
+					continue
+				}
+				if err := n.pullBlobFromPeer(ctx, nodeID, hash); err == nil {
+					break
+				}
 			}
 		}
 	}
@@ -943,7 +994,9 @@ func (n *Node) gcSnapshotBlobs() {
 			continue
 		}
 		for _, dataset := range manifest.Datasets {
-			retained[dataset.BlobHash] = struct{}{}
+			for _, hash := range datasetBlobHashes(dataset) {
+				retained[hash] = struct{}{}
+			}
 			if dataset.PreviousBlobHash != "" {
 				retained[dataset.PreviousBlobHash] = struct{}{}
 			}
@@ -961,7 +1014,9 @@ func (n *Node) retainStagingBlobs(manifest Manifest) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for _, dataset := range manifest.Datasets {
-		n.stagingBlobs[dataset.BlobHash]++
+		for _, hash := range datasetBlobHashes(dataset) {
+			n.stagingBlobs[hash]++
+		}
 	}
 }
 
@@ -969,10 +1024,12 @@ func (n *Node) releaseStagingBlobs(manifest Manifest) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for _, dataset := range manifest.Datasets {
-		if n.stagingBlobs[dataset.BlobHash] <= 1 {
-			delete(n.stagingBlobs, dataset.BlobHash)
-		} else {
-			n.stagingBlobs[dataset.BlobHash]--
+		for _, hash := range datasetBlobHashes(dataset) {
+			if n.stagingBlobs[hash] <= 1 {
+				delete(n.stagingBlobs, hash)
+			} else {
+				n.stagingBlobs[hash]--
+			}
 		}
 	}
 }
@@ -981,8 +1038,13 @@ func (n *Node) isCommittedBlob(hash string) bool {
 	state := n.Metadata()
 	for _, manifest := range state.Snapshots {
 		for _, dataset := range manifest.Datasets {
-			if dataset.BlobHash == hash || dataset.PreviousBlobHash == hash {
+			if dataset.PreviousBlobHash == hash {
 				return true
+			}
+			for _, blobHash := range datasetBlobHashes(dataset) {
+				if blobHash == hash {
+					return true
+				}
 			}
 		}
 	}
@@ -997,8 +1059,10 @@ func (n *Node) verifyManifestBlobs(manifest Manifest) error {
 		return ErrNodeNotStarted
 	}
 	for _, dataset := range manifest.Datasets {
-		if err := store.Verify(dataset.BlobHash); err != nil {
-			return fmt.Errorf("verify local blob %s: %w", dataset.BlobHash, err)
+		for _, hash := range datasetBlobHashes(dataset) {
+			if err := store.Verify(hash); err != nil {
+				return fmt.Errorf("verify local blob %s: %w", hash, err)
+			}
 		}
 	}
 	return nil
@@ -1014,8 +1078,10 @@ func (n *Node) replicateManifestToPeer(ctx context.Context, nodeID string, manif
 		return err
 	}
 	for _, dataset := range manifest.Datasets {
-		if err := n.putBlobToPeer(ctx, client, base, dataset.BlobHash); err != nil {
-			return err
+		for _, hash := range datasetBlobHashes(dataset) {
+			if err := n.putBlobToPeer(ctx, client, base, hash); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1751,7 +1817,31 @@ func (n *Node) VerifyBusinessLeadership(ctx context.Context) error {
 	}
 }
 
+type LocalReadResult struct {
+	Stale bool
+}
+
 func (n *Node) VerifyLocalRead(ctx context.Context, generation Generation) error {
+	_, err := n.VerifyLocalReadResult(ctx, generation)
+	return err
+}
+
+func (n *Node) VerifyLocalReadResult(ctx context.Context, generation Generation) (LocalReadResult, error) {
+	err := n.verifyLocalReadStrict(ctx, generation)
+	if err == nil {
+		return LocalReadResult{}, nil
+	}
+	if !n.cfg.EmergencyStaleRead {
+		return LocalReadResult{}, err
+	}
+	manifest, ok := n.Snapshot(generation)
+	if !ok || n.verifyManifestBlobs(manifest) != nil || time.Since(manifest.CreatedAt) > time.Duration(n.cfg.EmergencyStaleReadMaxAge) {
+		return LocalReadResult{}, err
+	}
+	return LocalReadResult{Stale: true}, nil
+}
+
+func (n *Node) verifyLocalReadStrict(ctx context.Context, generation Generation) error {
 	state := n.Metadata()
 	manifest, ok := state.Snapshots[generation.ManifestHash]
 	if !ok || !manifest.Generation.Equal(generation) || n.verifyManifestBlobs(manifest) != nil {
@@ -1764,6 +1854,16 @@ func (n *Node) VerifyLocalRead(ctx context.Context, generation Generation) error
 		return n.VerifyBusinessLeadership(ctx)
 	}
 	status := n.Status()
+	if n.cfg.ReadConsistency == "bounded" && !status.LastLeaderContactAt.IsZero() &&
+		time.Since(status.LastLeaderContactAt) <= time.Duration(n.cfg.MaxLeaderContactAge) &&
+		containsGeneration(status.AvailableGenerations, generation) {
+		n.mu.RLock()
+		r := n.raft
+		n.mu.RUnlock()
+		if r != nil && parseUint(r.Stats()["applied_index"]) >= state.ActiveSnapshotIndex {
+			return nil
+		}
+	}
 	if status.LeaderID == "" || status.LeaderID == n.cfg.NodeID || state.LeaderOwner != status.LeaderID {
 		if status.LeaderID == n.cfg.NodeID && n.HasBusinessLeadership() {
 			return n.VerifyBusinessLeadership(ctx)

@@ -14,6 +14,10 @@ const (
 	DefaultMaxLeaderContactAge       = 2 * time.Second
 	DefaultMaxQuorumVerificationAge  = 2 * time.Second
 	DefaultEmergencyStaleReadMaxAge  = 15 * time.Minute
+	DefaultSnapshotPublishInterval   = time.Minute
+	DefaultSnapshotPublishRetryMin   = 5 * time.Second
+	DefaultSnapshotPublishRetryMax   = time.Minute
+	DefaultSnapshotFreshnessMaxAge   = 5 * time.Minute
 	DefaultGenerationRetention       = 3
 	DefaultGenerationPinTTL          = 5 * time.Minute
 	DefaultMaxSnapshotBlobBytes      = int64(512 * 1024 * 1024)
@@ -40,6 +44,10 @@ type Config struct {
 	MaxQuorumVerificationAge   Duration  `toml:"max_quorum_verification_age"`
 	EmergencyStaleRead         bool      `toml:"emergency_stale_read"`
 	EmergencyStaleReadMaxAge   Duration  `toml:"emergency_stale_read_max_age"`
+	SnapshotPublishInterval    Duration  `toml:"snapshot_publish_interval"`
+	SnapshotPublishRetryMin    Duration  `toml:"snapshot_publish_retry_min"`
+	SnapshotPublishRetryMax    Duration  `toml:"snapshot_publish_retry_max"`
+	SnapshotFreshnessMaxAge    Duration  `toml:"snapshot_freshness_max_age"`
 	SnapshotDurablePolicy      string    `toml:"snapshot_durable_policy"`
 	AdditionalNonVoterReplicas int       `toml:"additional_non_voter_replicas"`
 	GenerationRetention        int       `toml:"generation_retention"`
@@ -76,6 +84,18 @@ func NormalizeConfig(cfg *Config) {
 	if cfg.EmergencyStaleReadMaxAge <= 0 {
 		cfg.EmergencyStaleReadMaxAge = Duration(DefaultEmergencyStaleReadMaxAge)
 	}
+	if cfg.SnapshotPublishInterval <= 0 {
+		cfg.SnapshotPublishInterval = Duration(DefaultSnapshotPublishInterval)
+	}
+	if cfg.SnapshotPublishRetryMin <= 0 {
+		cfg.SnapshotPublishRetryMin = Duration(DefaultSnapshotPublishRetryMin)
+	}
+	if cfg.SnapshotPublishRetryMax <= 0 {
+		cfg.SnapshotPublishRetryMax = Duration(DefaultSnapshotPublishRetryMax)
+	}
+	if cfg.SnapshotFreshnessMaxAge <= 0 {
+		cfg.SnapshotFreshnessMaxAge = Duration(DefaultSnapshotFreshnessMaxAge)
+	}
 	if cfg.SnapshotDurablePolicy == "" {
 		cfg.SnapshotDurablePolicy = SnapshotDurablePolicyVoterQuorum
 	}
@@ -96,6 +116,15 @@ func NormalizeConfig(cfg *Config) {
 func ValidateConfig(cfg Config) error {
 	if !cfg.Enabled {
 		return nil
+	}
+	if cfg.ReadConsistency != "bounded" && cfg.ReadConsistency != "linearizable" {
+		return fmt.Errorf("cluster.read_consistency must be %q or %q, got %q", "bounded", "linearizable", cfg.ReadConsistency)
+	}
+	if cfg.SnapshotPublishRetryMin > cfg.SnapshotPublishRetryMax {
+		return errors.New("cluster.snapshot_publish_retry_min must not exceed cluster.snapshot_publish_retry_max")
+	}
+	if cfg.SnapshotFreshnessMaxAge > cfg.EmergencyStaleReadMaxAge && cfg.EmergencyStaleRead {
+		return errors.New("cluster.emergency_stale_read_max_age must be at least cluster.snapshot_freshness_max_age")
 	}
 	if strings.TrimSpace(cfg.ClusterID) == "" {
 		return errors.New("cluster.cluster_id is required when cluster.enabled=true")

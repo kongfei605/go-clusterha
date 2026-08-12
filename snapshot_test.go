@@ -215,3 +215,17 @@ func TestManifestCapabilityTreatsZeroSchemaAsLegacyV1(t *testing.T) {
 		t.Fatal("inactive dataset schema was accepted")
 	}
 }
+
+func TestCloneManifestCopiesShardMetadata(t *testing.T) {
+	manifest := Manifest{Datasets: map[string]DatasetRef{"metrics/wan": {Shards: []DatasetShardRef{{Key: "org-a", BlobHash: "sha256:a"}}}}}
+	cloned := cloneManifest(manifest)
+	ref := cloned.Datasets["metrics/wan"]
+	ref.Shards[0].Key = "changed"
+	cloned.Datasets["metrics/wan"] = ref
+	if manifest.Datasets["metrics/wan"].Shards[0].Key != "org-a" {
+		t.Fatal("cloneManifest aliased shard metadata")
+	}
+	if hashes := datasetBlobHashes(manifest.Datasets["metrics/wan"]); len(hashes) != 1 || hashes[0] != "sha256:a" {
+		t.Fatalf("dataset shard hashes=%v", hashes)
+	}
+}

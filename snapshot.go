@@ -46,19 +46,43 @@ type Manifest struct {
 }
 
 type DatasetRef struct {
-	Name              string    `json:"name"`
-	SchemaVersion     uint32    `json:"schema_version"`
-	Scope             string    `json:"scope"`
-	BlobHash          string    `json:"blob_hash"`
-	Encoding          string    `json:"encoding"`
-	RecordCount       int64     `json:"record_count"`
-	CollectedAt       time.Time `json:"collected_at"`
-	SourceSuccess     bool      `json:"source_success"`
-	SourceError       string    `json:"source_error,omitempty"`
-	PreviousBlobHash  string    `json:"previous_blob_hash,omitempty"`
-	Required          bool      `json:"required"`
-	Stale             bool      `json:"stale"`
-	UncompressedBytes int64     `json:"uncompressed_bytes,omitempty"`
+	Name              string            `json:"name"`
+	SchemaVersion     uint32            `json:"schema_version"`
+	Scope             string            `json:"scope"`
+	BlobHash          string            `json:"blob_hash"`
+	Encoding          string            `json:"encoding"`
+	RecordCount       int64             `json:"record_count"`
+	CollectedAt       time.Time         `json:"collected_at"`
+	SourceSuccess     bool              `json:"source_success"`
+	SourceError       string            `json:"source_error,omitempty"`
+	PreviousBlobHash  string            `json:"previous_blob_hash,omitempty"`
+	Required          bool              `json:"required"`
+	Stale             bool              `json:"stale"`
+	UncompressedBytes int64             `json:"uncompressed_bytes,omitempty"`
+	Shards            []DatasetShardRef `json:"shards,omitempty"`
+}
+
+type DatasetShardRef struct {
+	Key               string `json:"key"`
+	BlobHash          string `json:"blob_hash"`
+	RecordCount       int64  `json:"record_count"`
+	UncompressedBytes int64  `json:"uncompressed_bytes"`
+}
+
+func datasetBlobHashes(dataset DatasetRef) []string {
+	if len(dataset.Shards) > 0 {
+		hashes := make([]string, 0, len(dataset.Shards))
+		for _, shard := range dataset.Shards {
+			if shard.BlobHash != "" {
+				hashes = append(hashes, shard.BlobHash)
+			}
+		}
+		return hashes
+	}
+	if dataset.BlobHash == "" {
+		return nil
+	}
+	return []string{dataset.BlobHash}
 }
 
 func validateManifestCapability(manifest Manifest, gate CapabilityGate) error {
@@ -86,6 +110,7 @@ func cloneManifest(manifest Manifest) Manifest {
 	copyManifest := manifest
 	copyManifest.Datasets = make(map[string]DatasetRef, len(manifest.Datasets))
 	for key, value := range manifest.Datasets {
+		value.Shards = append([]DatasetShardRef(nil), value.Shards...)
 		copyManifest.Datasets[key] = value
 	}
 	return copyManifest

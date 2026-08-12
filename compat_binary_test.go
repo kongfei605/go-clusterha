@@ -3,12 +3,16 @@ package clusterha
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -112,6 +116,22 @@ func runCompatClusterScenario(t *testing.T, oldBinary, newBinary string) {
 	if _, err := compatPutMetadata(t, leader, "compat/put-before-gate", "compat/value", true, state.Revision); err != nil {
 		t.Fatal(err)
 	}
+	if err := compatTransferLeadership(leader, processes[2].nodeID); err != nil {
+		t.Fatalf("transfer leadership to N binary: %v", err)
+	}
+	leader = waitForCompatLeader(t, processes, 30*time.Second)
+	if leader.nodeID != processes[2].nodeID {
+		t.Fatalf("leadership transferred to %s, want N node %s", leader.nodeID, processes[2].nodeID)
+	}
+	nGeneration, err := compatPublishDataset(leader, "dataset-written-by-n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, proc := range processes[:2] {
+		if got := compatReadDataset(t, proc, nGeneration); got != "dataset-written-by-n" {
+			t.Fatalf("N+1 node %s read N dataset %q", proc.nodeID, got)
+		}
+	}
 
 	gate := CapabilityGate{
 		ProtocolVersion: 1, CommandVersion: 1, ManifestSchemaVersion: 1,
@@ -140,6 +160,13 @@ func runCompatClusterScenario(t *testing.T, oldBinary, newBinary string) {
 	if _, err := compatPutMetadata(t, leader, "compat/put-after-gate", "compat/value2", true, state.Revision); err != nil {
 		t.Fatal(err)
 	}
+	nPlusOneGeneration, err := compatPublishDataset(leader, "dataset-written-by-n-plus-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := compatReadDataset(t, processes[2], nPlusOneGeneration); got != "dataset-written-by-n-plus-one" {
+		t.Fatalf("N node read compatible N+1 dataset %q", got)
+	}
 }
 
 func TestClusterHACompatChildProcess(t *testing.T) {
@@ -163,6 +190,8 @@ func TestClusterHACompatChildProcess(t *testing.T) {
 	}
 	if compatCapabilityLevel == "2" {
 		node.capabilities = testV2Capabilities()
+	} else {
+		node.capabilities = compatV1Capabilities()
 	}
 	node.SetServingReadiness(func() (bool, string) { return true, "" })
 	if err := node.Start(context.Background()); err != nil {
@@ -211,6 +240,59 @@ func TestClusterHACompatChildProcess(t *testing.T) {
 		}
 		writeCompatJSON(w, http.StatusOK, map[string]uint64{"revision": revision})
 	})
+	mux.HandleFunc("/transfer", func(w http.ResponseWriter, r *http.Request) {
+		if err := node.TransferLeadership(r.Context(), r.URL.Query().Get("node")); err != nil {
+			writeCompatError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeCompatJSON(w, http.StatusOK, map[string]bool{"transferred": true})
+	})
+	mux.HandleFunc("/publish", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Value string `json:"value"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeCompatError(w, http.StatusBadRequest, err)
+			return
+		}
+		data := []byte(req.Value)
+		blobHash := compatBlobHash(data)
+		status := node.Status()
+		manifest := Manifest{SchemaVersion: 1, Generation: Generation{ClusterID: status.ClusterID, LeaderEpoch: status.LeaderEpoch,
+			Sequence: node.Metadata().Revision + 1}, CreatedAt: time.Now().UTC(), Datasets: map[string]DatasetRef{"compat": {
+			Name: "compat", SchemaVersion: 1, Scope: "global", BlobHash: blobHash, Encoding: "text", RecordCount: 1,
+			CollectedAt: time.Now().UTC(), SourceSuccess: true, Required: true}}}
+		if _, err := node.PublishSnapshot(r.Context(), fmt.Sprintf("compat/publish/%d", manifest.Generation.Sequence), manifest,
+			map[string]io.Reader{blobHash: bytes.NewReader(data)}); err != nil {
+			writeCompatError(w, http.StatusInternalServerError, err)
+			return
+		}
+		active, ok := node.ActiveSnapshot()
+		if !ok {
+			writeCompatError(w, http.StatusInternalServerError, errors.New("published snapshot is not active"))
+			return
+		}
+		writeCompatJSON(w, http.StatusOK, active.Generation)
+	})
+	mux.HandleFunc("/dataset", func(w http.ResponseWriter, r *http.Request) {
+		generation, err := node.ParseGeneration(r.URL.Query().Get("generation"))
+		if err != nil {
+			writeCompatError(w, http.StatusBadRequest, err)
+			return
+		}
+		reader, _, err := node.OpenSnapshotDatasetAt(generation, "compat")
+		if err != nil {
+			writeCompatError(w, http.StatusNotFound, err)
+			return
+		}
+		defer reader.Close()
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			writeCompatError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeCompatJSON(w, http.StatusOK, map[string]string{"value": string(data)})
+	})
 
 	listener, err := net.Listen("tcp", cfg.AdminAddr)
 	if err != nil {
@@ -223,6 +305,11 @@ func TestClusterHACompatChildProcess(t *testing.T) {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt)
 	<-signals
+}
+
+func compatV1Capabilities() NodeCapabilities {
+	return NodeCapabilities{CapabilityLevel: 1, Protocol: VersionRange{Min: 1, Max: 1}, Command: VersionRange{Min: 1, Max: 1},
+		ManifestSchema: VersionRange{Min: 1, Max: 1}, DatasetSchema: VersionRange{Min: 1, Max: 1}}
 }
 
 func exportCompatOldSource(t *testing.T) string {
@@ -412,6 +499,44 @@ func compatActivateCapabilities(t *testing.T, proc *compatProcess, id string, ga
 	}
 	err := compatPostJSON(proc.admin+"/activate", map[string]any{"id": id, "gate": gate}, &resp)
 	return resp.Revision, err
+}
+
+func compatTransferLeadership(proc *compatProcess, nodeID string) error {
+	var response map[string]bool
+	return compatPostJSON(proc.admin+"/transfer?node="+url.QueryEscape(nodeID), map[string]any{}, &response)
+}
+
+func compatPublishDataset(proc *compatProcess, value string) (Generation, error) {
+	var generation Generation
+	err := compatPostJSON(proc.admin+"/publish", map[string]string{"value": value}, &generation)
+	return generation, err
+}
+
+func compatReadDataset(t *testing.T, proc *compatProcess, generation Generation) string {
+	t.Helper()
+	endpoint := proc.admin + "/dataset?generation=" + url.QueryEscape(generation.String())
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := (&http.Client{Timeout: 2 * time.Second}).Get(endpoint)
+		if err == nil {
+			var response struct {
+				Value string `json:"value"`
+			}
+			decodeErr := json.NewDecoder(resp.Body).Decode(&response)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK && decodeErr == nil {
+				return response.Value
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("compat child %s did not make generation %s dataset available", proc.nodeID, generation.String())
+	return ""
+}
+
+func compatBlobHash(data []byte) string {
+	sum := sha256.Sum256(data)
+	return HashPrefixSHA256 + hex.EncodeToString(sum[:])
 }
 
 func compatGetJSON(t *testing.T, endpoint string, target any) {

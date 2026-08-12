@@ -12,9 +12,9 @@ const (
 
 	CurrentProtocolVersion       uint32 = 1
 	CurrentCommandVersion        uint32 = 1
-	CurrentManifestSchemaVersion uint32 = 1
-	CurrentDatasetSchemaVersion  uint32 = 1
-	CurrentCapabilityLevel       uint32 = 1
+	CurrentManifestSchemaVersion uint32 = 2
+	CurrentDatasetSchemaVersion  uint32 = 2
+	CurrentCapabilityLevel       uint32 = 2
 )
 
 type VersionRange struct {

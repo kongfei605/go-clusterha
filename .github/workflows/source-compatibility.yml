@@ -1,0 +1,22 @@
+name: Source compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  n-n-plus-one:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run real N/N+1 source compatibility test
+        env:
+          CLUSTERHA_RUN_SOURCE_COMPAT: "1"
+        run: go test -run '^TestNNPlusOneSourceCompatibility$' -count=1 .

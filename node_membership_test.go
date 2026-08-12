@@ -44,9 +44,9 @@ func TestValidateCapabilityActivationVotersRequiresLeaderEligibleVoter(t *testin
 		MinimumVoterCapability: 1, MinimumLeaderCapability: 2,
 	}
 	voters := map[string]NodeCapabilities{
-		"node-a": SupportedNodeCapabilities(),
-		"node-b": SupportedNodeCapabilities(),
-		"node-c": SupportedNodeCapabilities(),
+		"node-a": testV1Capabilities(),
+		"node-b": testV1Capabilities(),
+		"node-c": testV1Capabilities(),
 	}
 	if err := validateCapabilityActivationVoters(voters, gate); err == nil {
 		t.Fatal("capability gate with no leader-eligible voter was accepted")
