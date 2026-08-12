@@ -78,6 +78,10 @@ type Status struct {
 	Capabilities             NodeCapabilities `json:"capabilities"`
 	ActiveCapabilityGate     CapabilityGate   `json:"active_capability_gate"`
 	LeaderEligible           bool             `json:"leader_eligible"`
+	FSMHealthy               bool             `json:"fsm_healthy"`
+	FSMRevision              uint64           `json:"fsm_revision"`
+	FSMApplyError            string           `json:"fsm_apply_error,omitempty"`
+	FSMApplyErrorIndex       uint64           `json:"fsm_apply_error_index,omitempty"`
 }
 
 const membershipOperationMetadataKey = "cluster/membership_operation"
@@ -134,6 +138,7 @@ type Node struct {
 	blobPutSem       chan struct{}
 	configurationMu  sync.Mutex
 	membershipMu     sync.Mutex
+	capabilities     NodeCapabilities
 }
 
 func NewNode(cfg Config) (*Node, error) {
@@ -142,7 +147,8 @@ func NewNode(cfg Config) (*Node, error) {
 		return nil, err
 	}
 	node := &Node{cfg: cfg, done: make(chan struct{}), subs: make(map[chan LeadershipEvent]struct{}),
-		stagingBlobs: make(map[string]int), pendingMembers: make(map[string]Member), blobPutSem: make(chan struct{}, cfg.MaxSnapshotBlobPuts)}
+		stagingBlobs: make(map[string]int), pendingMembers: make(map[string]Member), blobPutSem: make(chan struct{}, cfg.MaxSnapshotBlobPuts),
+		capabilities: SupportedNodeCapabilities()}
 	if !cfg.Enabled {
 		node.status = Status{Enabled: false, Ready: true, Readiness: ReadinessReady, Role: RoleDisabled,
 			Reason: "cluster disabled; running existing single-instance mode"}
@@ -256,6 +262,12 @@ func (n *Node) startRaft() error {
 		}
 	}
 	fsm := newMetadataFSM(n.cfg.ClusterID)
+	fsm.capabilities = n.capabilities
+	if err := fsm.configureApplyFaultFile(filepath.Join(raftDir, "fsm-apply-fault.json")); err != nil {
+		transport.Close()
+		_ = store.Close()
+		return fmt.Errorf("load FSM apply fault marker: %w", err)
+	}
 	r, err := raft.NewRaft(config, fsm, store, store, snapshots, transport)
 	if err != nil {
 		transport.Close()
@@ -371,7 +383,7 @@ func (n *Node) refreshStatus(verify bool) {
 	var verifiedAt time.Time
 	if r.State() == raft.Leader {
 		role = RoleLeaderWarming
-		if !SupportedNodeCapabilities().SupportsGate(state.CapabilityGate, true) {
+		if !n.capabilities.SupportsGate(state.CapabilityGate, true) {
 			reason := "node does not satisfy the active minimum leader capability"
 			n.updateStatus(role, leaderID, leaderAddr, state, stats, false, time.Time{}, reason, now)
 			n.setLeadership(false, state.LeaderEpoch, reason)
@@ -434,9 +446,10 @@ func (n *Node) updateUnjoinedStatus() {
 	n.status.HasQuorum = false
 	n.status.ProtocolVersion = CurrentProtocolVersion
 	n.status.CommandVersion = CurrentCommandVersion
-	n.status.Capabilities = SupportedNodeCapabilities()
+	n.status.Capabilities = n.capabilities
 	n.status.ActiveCapabilityGate = LegacyCapabilityGate()
 	n.status.LeaderEligible = false
+	n.status.FSMHealthy = true
 }
 
 func (n *Node) raftConfigurationContainsSelf(r *raft.Raft) bool {
@@ -552,6 +565,8 @@ func (n *Node) PutMetadataBatch(ctx context.Context, commandID string, values ma
 }
 
 func (n *Node) ActivateCapabilities(ctx context.Context, commandID string, gate CapabilityGate) (uint64, error) {
+	n.membershipMu.Lock()
+	defer n.membershipMu.Unlock()
 	if err := n.VerifyBusinessLeadership(ctx); err != nil {
 		return 0, err
 	}
@@ -559,7 +574,13 @@ func (n *Node) ActivateCapabilities(ctx context.Context, commandID string, gate 
 	if err := validateCapabilityGate(gate); err != nil {
 		return 0, err
 	}
-	voters, err := n.voterStatuses(ctx)
+	if operation, ok, err := n.membershipOperation(); err != nil {
+		return 0, err
+	} else if ok && operation.Phase != MembershipPhaseCompleted {
+		return 0, fmt.Errorf("cannot activate capabilities while membership operation %q for node %q is active", operation.Type, operation.Member.NodeID)
+	}
+	activeGate := n.Metadata().CapabilityGate
+	voters, err := n.voterStatuses(ctx, activeGate)
 	if err != nil {
 		return 0, err
 	}
@@ -578,7 +599,7 @@ func (n *Node) ActivateCapabilities(ctx context.Context, commandID string, gate 
 	return result.Revision, err
 }
 
-func (n *Node) voterStatuses(ctx context.Context) (map[string]NodeCapabilities, error) {
+func (n *Node) voterStatuses(ctx context.Context, activeGate CapabilityGate) (map[string]NodeCapabilities, error) {
 	_, voters, err := n.voterConfiguration()
 	if err != nil {
 		return nil, err
@@ -591,7 +612,11 @@ func (n *Node) voterStatuses(ctx context.Context) (map[string]NodeCapabilities, 
 	for _, voter := range voters {
 		nodeID := string(voter.ID)
 		if nodeID == n.cfg.NodeID {
-			result[nodeID] = SupportedNodeCapabilities()
+			status := n.Status()
+			if !status.FSMHealthy || !capabilityGatesEqual(status.ActiveCapabilityGate, activeGate) {
+				return nil, fmt.Errorf("local voter is not healthy on the active capability gate")
+			}
+			result[nodeID] = n.capabilities
 			continue
 		}
 		base, ok := n.internalAPIURLForNode(nodeID)
@@ -611,6 +636,18 @@ func (n *Node) voterStatuses(ctx context.Context) (map[string]NodeCapabilities, 
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK || decodeErr != nil {
 			return nil, fmt.Errorf("read voter %q capabilities returned %s: %v", nodeID, resp.Status, decodeErr)
+		}
+		if status.ClusterID != n.cfg.ClusterID || status.NodeID != nodeID {
+			return nil, fmt.Errorf("voter %q status identity does not match committed membership", nodeID)
+		}
+		if !status.FSMHealthy || status.FSMApplyError != "" {
+			return nil, fmt.Errorf("voter %q FSM is unhealthy at index %d: %s", nodeID, status.FSMApplyErrorIndex, status.FSMApplyError)
+		}
+		if status.AppliedIndex < status.CommitIndex {
+			return nil, fmt.Errorf("voter %q is not caught up: applied=%d commit=%d", nodeID, status.AppliedIndex, status.CommitIndex)
+		}
+		if !capabilityGatesEqual(status.ActiveCapabilityGate, activeGate) {
+			return nil, fmt.Errorf("voter %q has not applied the active capability gate", nodeID)
 		}
 		result[nodeID] = status.Capabilities
 	}
@@ -1010,6 +1047,8 @@ func (n *Node) AddVoter(context.Context, Member) error {
 }
 
 func (n *Node) RemoveServer(ctx context.Context, nodeID string) error {
+	n.membershipMu.Lock()
+	defer n.membershipMu.Unlock()
 	if err := n.VerifyBusinessLeadership(ctx); err != nil {
 		return err
 	}
@@ -1025,7 +1064,7 @@ func (n *Node) RemoveServer(ctx context.Context, nodeID string) error {
 		if operation.Type != MembershipOperationRemove || operation.Member.NodeID != nodeID {
 			return fmt.Errorf("membership operation %q for node %q is already active", operation.Type, operation.Member.NodeID)
 		}
-		return n.reconcileMembershipOperation(ctx)
+		return n.reconcileMembershipOperationLocked(ctx)
 	}
 	members := n.committedMembers()
 	member, ok := members[nodeID]
@@ -1040,10 +1079,12 @@ func (n *Node) RemoveServer(ctx context.Context, nodeID string) error {
 	if err := n.beginMembershipOperation(ctx, op); err != nil {
 		return err
 	}
-	return n.reconcileMembershipOperation(ctx)
+	return n.reconcileMembershipOperationLocked(ctx)
 }
 
 func (n *Node) JoinVoter(ctx context.Context, member Member) error {
+	n.membershipMu.Lock()
+	defer n.membershipMu.Unlock()
 	if err := n.VerifyBusinessLeadership(ctx); err != nil {
 		return err
 	}
@@ -1061,7 +1102,7 @@ func (n *Node) JoinVoter(ctx context.Context, member Member) error {
 		}
 		n.addPendingMember(member)
 		n.refreshPeerRegistry()
-		return n.reconcileMembershipOperation(ctx)
+		return n.reconcileMembershipOperationLocked(ctx)
 	}
 	if existing, ok := n.committedMembers()[member.NodeID]; ok {
 		if existing == member {
@@ -1090,7 +1131,7 @@ func (n *Node) JoinVoter(ctx context.Context, member Member) error {
 		n.refreshPeerRegistry()
 		return err
 	}
-	return n.reconcileMembershipOperation(ctx)
+	return n.reconcileMembershipOperationLocked(ctx)
 }
 
 func (n *Node) prepareJoiningMember(ctx context.Context, member Member) (NodeCapabilities, error) {
@@ -1162,6 +1203,10 @@ func (n *Node) membershipOperation() (MembershipOperation, bool, error) {
 func (n *Node) reconcileMembershipOperation(ctx context.Context) error {
 	n.membershipMu.Lock()
 	defer n.membershipMu.Unlock()
+	return n.reconcileMembershipOperationLocked(ctx)
+}
+
+func (n *Node) reconcileMembershipOperationLocked(ctx context.Context) error {
 	if err := n.VerifyBusinessLeadership(ctx); err != nil {
 		return err
 	}
@@ -1189,7 +1234,8 @@ func (n *Node) reconcileMembershipOperation(ctx context.Context) error {
 }
 
 func (n *Node) reconcileJoinOperation(ctx context.Context, operation MembershipOperation) error {
-	if !operation.Capabilities.SupportsGate(n.Metadata().CapabilityGate, false) {
+	gate := n.Metadata().CapabilityGate
+	if !operation.Capabilities.SupportsGate(gate, false) {
 		return fmt.Errorf("joining node %q no longer satisfies the active capability gate", operation.Member.NodeID)
 	}
 	suffrage, present, err := n.raftServerSuffrage(operation.Member.NodeID)
@@ -1206,11 +1252,21 @@ func (n *Node) reconcileJoinOperation(ctx context.Context, operation MembershipO
 		suffrage = raft.Nonvoter
 	}
 	if suffrage == raft.Nonvoter {
-		if err := n.waitForJoiningNodeCatchUp(ctx, operation.Member); err != nil {
+		if err := n.waitForJoiningNodeCatchUp(ctx, operation.Member, gate); err != nil {
 			return err
+		}
+		currentGate := n.Metadata().CapabilityGate
+		if !capabilityGatesEqual(currentGate, gate) {
+			return fmt.Errorf("active capability gate changed while joining node %q was catching up", operation.Member.NodeID)
 		}
 		if err := n.updateMembershipOperation(ctx, &operation, MembershipPhaseCaughtUp); err != nil {
 			return err
+		}
+		if err := n.waitForJoiningNodeCatchUp(ctx, operation.Member, currentGate); err != nil {
+			return err
+		}
+		if !capabilityGatesEqual(n.Metadata().CapabilityGate, currentGate) {
+			return fmt.Errorf("active capability gate changed immediately before promoting node %q", operation.Member.NodeID)
 		}
 		if err := n.raftAddVoter(ctx, operation.Member); err != nil {
 			return err
@@ -1330,7 +1386,7 @@ func (n *Node) runConfigurationChange(ctx context.Context, start func(*raft.Raft
 	}
 }
 
-func (n *Node) waitForJoiningNodeCatchUp(ctx context.Context, member Member) error {
+func (n *Node) waitForJoiningNodeCatchUp(ctx context.Context, member Member, expectedGate CapabilityGate) error {
 	n.mu.RLock()
 	r := n.raft
 	n.mu.RUnlock()
@@ -1341,25 +1397,20 @@ func (n *Node) waitForJoiningNodeCatchUp(ctx context.Context, member Member) err
 		return err
 	}
 	target := parseUint(r.Stats()["commit_index"])
-	client, err := n.internalHTTPClient()
-	if err != nil {
-		return err
-	}
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		if !n.HasBusinessLeadership() {
 			return ErrNotBusinessLeader
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(member.InternalAPIURL, "/")+"/internal/v1/status", nil)
-		if err == nil {
-			if resp, requestErr := client.Do(req); requestErr == nil {
-				var status Status
-				decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&status)
-				_ = resp.Body.Close()
-				if resp.StatusCode == http.StatusOK && decodeErr == nil && status.AppliedIndex >= target {
-					return nil
-				}
+		status, err := n.joiningNodeStatus(ctx, member)
+		if err == nil && status.AppliedIndex >= target {
+			caughtUp, err := n.validateJoiningNodeStatus(member, status, expectedGate)
+			if err != nil {
+				return err
+			}
+			if caughtUp {
+				return nil
 			}
 		}
 		select {
@@ -1368,6 +1419,56 @@ func (n *Node) waitForJoiningNodeCatchUp(ctx context.Context, member Member) err
 		case <-ticker.C:
 		}
 	}
+}
+
+func (n *Node) joiningNodeStatus(ctx context.Context, member Member) (Status, error) {
+	client, err := n.internalHTTPClient()
+	if err != nil {
+		return Status{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(member.InternalAPIURL, "/")+"/internal/v1/status", nil)
+	if err != nil {
+		return Status{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return Status{}, err
+	}
+	defer resp.Body.Close()
+	var status Status
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&status); err != nil {
+		return Status{}, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return Status{}, fmt.Errorf("joining node %q status returned %s", member.NodeID, resp.Status)
+	}
+	return status, nil
+}
+
+func (n *Node) validateJoiningNodeStatus(member Member, status Status, gate CapabilityGate) (bool, error) {
+	if status.ClusterID != n.cfg.ClusterID || status.NodeID != member.NodeID {
+		return false, fmt.Errorf("joining node status identity does not match node %q", member.NodeID)
+	}
+	if !status.FSMHealthy || status.FSMApplyError != "" {
+		return false, fmt.Errorf("joining node %q FSM is unhealthy at index %d: %s", member.NodeID, status.FSMApplyErrorIndex, status.FSMApplyError)
+	}
+	if status.AppliedIndex < status.CommitIndex {
+		return false, nil
+	}
+	if !capabilityGatesEqual(status.ActiveCapabilityGate, gate) {
+		return false, fmt.Errorf("joining node %q has a different active capability gate", member.NodeID)
+	}
+	if !status.Capabilities.SupportsGate(gate, false) {
+		return false, fmt.Errorf("joining node %q no longer supports the active capability gate", member.NodeID)
+	}
+	leaderState := n.Metadata()
+	if status.FSMRevision != leaderState.Revision {
+		return false, nil
+	}
+	if !status.CommittedGeneration.IsZero() && !containsGeneration(status.AvailableGenerations, status.CommittedGeneration) {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (n *Node) TransferLeadership(ctx context.Context, nodeID string) error {
@@ -1424,13 +1525,20 @@ func (n *Node) removePendingMember(nodeID string) {
 
 func (n *Node) refreshPeerRegistry() {
 	members := n.committedMembers()
+	removedNodeID := ""
 	if operation, ok, err := n.membershipOperation(); err == nil && ok && operation.Phase != MembershipPhaseCompleted {
-		if operation.Type != MembershipOperationRemove || operation.Phase != MembershipPhaseRemoved {
+		if operation.Type == MembershipOperationRemove && operation.Phase == MembershipPhaseRemoved {
+			delete(members, operation.Member.NodeID)
+			removedNodeID = operation.Member.NodeID
+		} else {
 			members[operation.Member.NodeID] = operation.Member
 		}
 	}
 	n.mu.RLock()
 	for nodeID, member := range n.pendingMembers {
+		if nodeID == removedNodeID {
+			continue
+		}
 		members[nodeID] = member
 	}
 	n.mu.RUnlock()
@@ -1727,7 +1835,10 @@ func (n *Node) checkLocalBusinessLeadership(now time.Time, r *raft.Raft, fsm *me
 		return ErrNotBusinessLeader
 	}
 	state := fsm.State()
-	if !SupportedNodeCapabilities().SupportsGate(state.CapabilityGate, true) {
+	if _, faulted := fsm.ApplyFault(); faulted {
+		return ErrNotBusinessLeader
+	}
+	if !n.capabilities.SupportsGate(state.CapabilityGate, true) {
 		return ErrNotBusinessLeader
 	}
 	stats := r.Stats()
@@ -1796,9 +1907,20 @@ func (n *Node) updateStatus(role string, leaderID raft.ServerID, leaderAddr raft
 	n.status.AvailableGenerations = availableGenerations
 	n.status.ProtocolVersion = CurrentProtocolVersion
 	n.status.CommandVersion = CurrentCommandVersion
-	n.status.Capabilities = SupportedNodeCapabilities()
+	n.status.Capabilities = n.capabilities
 	n.status.ActiveCapabilityGate = normalizeCapabilityGate(state.CapabilityGate)
-	n.status.LeaderEligible = SupportedNodeCapabilities().SupportsGate(state.CapabilityGate, true)
+	n.status.LeaderEligible = n.capabilities.SupportsGate(state.CapabilityGate, true)
+	n.status.FSMHealthy = true
+	n.status.FSMRevision = state.Revision
+	n.status.FSMApplyError = ""
+	n.status.FSMApplyErrorIndex = 0
+	if n.fsm != nil {
+		if fault, ok := n.fsm.ApplyFault(); ok {
+			n.status.FSMHealthy = false
+			n.status.FSMApplyError = fault.Error
+			n.status.FSMApplyErrorIndex = fault.Index
+		}
+	}
 	if manifest, ok := state.Snapshots[state.ActiveSnapshot]; ok {
 		n.status.CommittedGeneration = manifest.Generation
 	}
@@ -1819,7 +1941,7 @@ func (n *Node) updateStatus(role string, leaderID raft.ServerID, leaderAddr raft
 	case RoleFollower:
 		transportReady = leaderID != "" && contact >= 0 && contact <= time.Duration(n.cfg.MaxLeaderContactAge)
 	}
-	n.status.Ready = transportReady && applicationReady && n.status.LeaderEligible
+	n.status.Ready = transportReady && applicationReady && n.status.LeaderEligible && n.status.FSMHealthy
 	n.status.Readiness = ReadinessNotReady
 	if n.status.Ready {
 		n.status.Readiness = ReadinessReady

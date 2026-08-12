@@ -28,6 +28,7 @@ func (n *Node) startInternalServer() error {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /internal/v1/status", func(w http.ResponseWriter, _ *http.Request) {
+		n.refreshStatus(false)
 		writeJSON(w, http.StatusOK, n.Status())
 	})
 	mux.HandleFunc("POST /internal/v1/barrier", func(w http.ResponseWriter, r *http.Request) {
@@ -53,7 +54,7 @@ func (n *Node) startInternalServer() error {
 			"join_existing":         n.cfg.JoinExisting,
 			"initial_member_count":  len(n.cfg.InitialMembers),
 			"bootstrap_expectation": n.cfg.BootstrapExpect,
-			"capabilities":          SupportedNodeCapabilities(),
+			"capabilities":          n.capabilities,
 		})
 	})
 	mux.HandleFunc("POST /internal/v1/admin/nodes", func(w http.ResponseWriter, r *http.Request) {

@@ -2,6 +2,7 @@ package clusterha
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -40,6 +41,40 @@ func TestMetadataBatchApplyIsAtomicOnValidationFailure(t *testing.T) {
 	}
 }
 
+func TestMetadataFSMApplyFaultPersistsAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fsm-apply-fault.json")
+	fsm := newMetadataFSM("cluster")
+	if err := fsm.configureApplyFaultFile(path); err != nil {
+		t.Fatal(err)
+	}
+	result := fsm.Apply(&raft.Log{Index: 17, Data: mustJSON(t, Command{
+		ID: "future", Type: CommandAcquireLeadership, ProtocolVersion: 2, CommandVersion: 2,
+	})}).(applyResult)
+	if result.Error == "" {
+		t.Fatal("expected unsupported command failure")
+	}
+	restarted := newMetadataFSM("cluster")
+	if err := restarted.configureApplyFaultFile(path); err != nil {
+		t.Fatal(err)
+	}
+	if fault, ok := restarted.ApplyFault(); !ok || fault.Index != 17 || fault.Error == "" {
+		t.Fatalf("persisted fault missing after restart: fault=%#v ok=%t", fault, ok)
+	}
+	restarted.state.LeaderEpoch = 1
+	restarted.state.LeaderOwner = "node-a"
+	payload := mustJSON(t, putMetadataPayload{Key: "must-not-apply", Value: json.RawMessage(`true`)})
+	result = restarted.Apply(&raft.Log{Index: 18, Data: mustJSON(t, Command{
+		ID: "after-fault", Type: CommandPutMetadata, ProtocolVersion: 1, CommandVersion: 1,
+		LeaderEpoch: 1, Payload: payload,
+	})}).(applyResult)
+	if result.Error == "" {
+		t.Fatal("faulted FSM accepted a later command")
+	}
+	if _, ok := restarted.State().Values["must-not-apply"]; ok {
+		t.Fatal("faulted FSM mutated state after its first apply fault")
+	}
+}
+
 func TestMetadataFSMRejectsUnsupportedCommandVersion(t *testing.T) {
 	fsm := newMetadataFSM("cluster")
 	result := fsm.Apply(&raft.Log{Index: 1, Data: mustJSON(t, Command{
@@ -51,6 +86,28 @@ func TestMetadataFSMRejectsUnsupportedCommandVersion(t *testing.T) {
 	}
 	if fsm.State().Revision != 0 {
 		t.Fatal("unsupported command must not mutate state")
+	}
+	if fault, ok := fsm.ApplyFault(); !ok || fault.Index != 1 || fault.Error == "" {
+		t.Fatalf("unsupported command did not record FSM fault: fault=%#v ok=%t", fault, ok)
+	}
+}
+
+func TestMetadataFSMRevisionConflictDoesNotPoisonHealth(t *testing.T) {
+	fsm := newMetadataFSM("cluster")
+	fsm.state.LeaderEpoch = 1
+	fsm.state.LeaderOwner = "node-a"
+	expected := uint64(9)
+	result := fsm.Apply(&raft.Log{Index: 1, Data: mustJSON(t, Command{
+		ID: "conflict", Type: CommandPutMetadata, ProtocolVersion: 1, CommandVersion: 1,
+		ExpectedRevision: &expected, LeaderEpoch: 1,
+		Payload:   mustJSON(t, putMetadataPayload{Key: "key", Value: json.RawMessage(`"value"`)}),
+		CreatedAt: time.Unix(0, 0).UTC(),
+	})}).(applyResult)
+	if result.Error == "" {
+		t.Fatal("expected revision conflict")
+	}
+	if fault, ok := fsm.ApplyFault(); ok {
+		t.Fatalf("deterministic CAS rejection poisoned FSM health: %#v", fault)
 	}
 }
 

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -110,6 +112,14 @@ type metadataFSM struct {
 	mu           sync.RWMutex
 	state        MetadataState
 	capabilities NodeCapabilities
+	faultMu      sync.RWMutex
+	applyFault   FSMApplyFault
+	faultFile    string
+}
+
+type FSMApplyFault struct {
+	Index uint64 `json:"index"`
+	Error string `json:"error"`
 }
 
 func newMetadataFSM(clusterID string) *metadataFSM {
@@ -125,10 +135,14 @@ func newMetadataFSM(clusterID string) *metadataFSM {
 func (f *metadataFSM) Apply(log *raft.Log) any {
 	var command Command
 	if err := json.Unmarshal(log.Data, &command); err != nil {
-		return applyResult{Error: fmt.Sprintf("decode command: %v", err)}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.recordApplyFaultLocked(log.Index, fmt.Sprintf("decode command: %v", err))
 	}
 	if command.ID == "" {
-		return applyResult{Error: "command_id is required"}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.recordApplyFaultLocked(log.Index, "command_id is required")
 	}
 	if command.ProtocolVersion == 0 {
 		command.ProtocolVersion = LegacyProtocolVersion
@@ -136,17 +150,19 @@ func (f *metadataFSM) Apply(log *raft.Log) any {
 	if command.CommandVersion == 0 {
 		command.CommandVersion = LegacyCommandVersion
 	}
-	if !f.capabilities.Protocol.Supports(command.ProtocolVersion) || !f.capabilities.Command.Supports(command.CommandVersion) {
-		return applyResult{Error: fmt.Sprintf("unsupported command version protocol=%d command=%d", command.ProtocolVersion, command.CommandVersion)}
-	}
-
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if fault, faulted := f.ApplyFault(); faulted {
+		return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch,
+			Error: fmt.Sprintf("FSM is halted after apply fault at index %d: %s", fault.Index, fault.Error)}
+	}
+	if !f.capabilities.Protocol.Supports(command.ProtocolVersion) || !f.capabilities.Command.Supports(command.CommandVersion) {
+		return f.recordApplyFaultLocked(log.Index, fmt.Sprintf("unsupported command version protocol=%d command=%d", command.ProtocolVersion, command.CommandVersion))
+	}
 	gate := normalizeCapabilityGate(f.state.CapabilityGate)
 	if command.ProtocolVersion != gate.ProtocolVersion || command.CommandVersion != gate.CommandVersion {
-		return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch,
-			Error: fmt.Sprintf("command version protocol=%d command=%d is not active; active protocol=%d command=%d",
-				command.ProtocolVersion, command.CommandVersion, gate.ProtocolVersion, gate.CommandVersion)}
+		return f.recordApplyFaultLocked(log.Index, fmt.Sprintf("command version protocol=%d command=%d is not active; active protocol=%d command=%d",
+			command.ProtocolVersion, command.CommandVersion, gate.ProtocolVersion, gate.CommandVersion))
 	}
 	digest, err := commandDigest(command)
 	if err != nil {
@@ -229,7 +245,7 @@ func (f *metadataFSM) Apply(log *raft.Log) any {
 			return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: "snapshot leader epoch is not current"}
 		}
 		if err := validateManifestCapability(payload.Manifest, gate); err != nil {
-			return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: err.Error()}
+			return f.recordApplyFaultLocked(log.Index, err.Error())
 		}
 		hash, err := ComputeManifestHash(payload.Manifest)
 		if err != nil {
@@ -257,16 +273,84 @@ func (f *metadataFSM) Apply(log *raft.Log) any {
 			return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: err.Error()}
 		}
 		if !f.capabilities.SupportsGate(payload.Gate, false) {
-			return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: "local node does not support requested capability gate"}
+			return f.recordApplyFaultLocked(log.Index, "local node does not support requested capability gate")
 		}
 		f.state.CapabilityGate = payload.Gate
 	default:
-		return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: fmt.Sprintf("unsupported command type %q", command.Type)}
+		return f.recordApplyFaultLocked(log.Index, fmt.Sprintf("unsupported command type %q", command.Type))
 	}
 
 	f.state.Revision++
 	f.state.AppliedCommands[command.ID] = AppliedCommand{Revision: f.state.Revision, Digest: digest}
 	return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch}
+}
+
+func (f *metadataFSM) recordApplyFaultLocked(index uint64, message string) applyResult {
+	f.faultMu.Lock()
+	if f.applyFault.Error == "" {
+		f.applyFault = FSMApplyFault{Index: index, Error: message}
+		_ = persistFSMApplyFault(f.faultFile, f.applyFault)
+	}
+	f.faultMu.Unlock()
+	return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: message}
+}
+
+func (f *metadataFSM) ApplyFault() (FSMApplyFault, bool) {
+	f.faultMu.RLock()
+	defer f.faultMu.RUnlock()
+	return f.applyFault, f.applyFault.Error != ""
+}
+
+func (f *metadataFSM) configureApplyFaultFile(path string) error {
+	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
+	f.faultFile = path
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if err := json.Unmarshal(data, &f.applyFault); err != nil {
+		return fmt.Errorf("decode persisted FSM apply fault: %w", err)
+	}
+	return nil
+}
+
+func persistFSMApplyFault(path string, fault FSMApplyFault) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(fault)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".fsm-apply-fault-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func commandDigest(command Command) (string, error) {

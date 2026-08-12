@@ -107,6 +107,24 @@ func (g CapabilityGate) DatasetSchemaVersion(name string) uint32 {
 	return LegacyDatasetSchemaVersion
 }
 
+func capabilityGatesEqual(left, right CapabilityGate) bool {
+	left = normalizeCapabilityGate(left)
+	right = normalizeCapabilityGate(right)
+	if left.ProtocolVersion != right.ProtocolVersion || left.CommandVersion != right.CommandVersion ||
+		left.ManifestSchemaVersion != right.ManifestSchemaVersion ||
+		left.MinimumLeaderCapability != right.MinimumLeaderCapability ||
+		left.MinimumVoterCapability != right.MinimumVoterCapability ||
+		len(left.DatasetSchemaVersions) != len(right.DatasetSchemaVersions) {
+		return false
+	}
+	for name, version := range left.DatasetSchemaVersions {
+		if right.DatasetSchemaVersions[name] != version {
+			return false
+		}
+	}
+	return true
+}
+
 func (c NodeCapabilities) SupportsGate(gate CapabilityGate, leader bool) bool {
 	gate = normalizeCapabilityGate(gate)
 	minimum := gate.MinimumVoterCapability

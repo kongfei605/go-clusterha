@@ -50,6 +50,9 @@ func TestThreeNodeElectionReplicationAndFailover(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if nodeID != "node-c" {
+			node.capabilities = testV2Capabilities()
+		}
 		if err := node.Start(t.Context()); err != nil {
 			t.Fatal(err)
 		}
@@ -171,6 +174,7 @@ func TestThreeNodeElectionReplicationAndFailover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	joinNode.capabilities = testV2Capabilities()
 	if err := joinNode.Start(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -187,6 +191,16 @@ func TestThreeNodeElectionReplicationAndFailover(t *testing.T) {
 		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	if err := leader.beginMembershipOperation(context.Background(), joinOperation); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := leader.ActivateCapabilities(context.Background(), "gate-during-join", LegacyCapabilityGate()); err == nil {
+		t.Fatal("capability activation must be rejected while a membership operation is active")
+	}
+	v2Gate := CapabilityGate{
+		ProtocolVersion: 2, CommandVersion: 2, ManifestSchemaVersion: 1,
+		DatasetSchemaVersions: map[string]uint32{"*": 1}, MinimumLeaderCapability: 2, MinimumVoterCapability: 2,
+	}
+	if _, err := leader.ActivateCapabilities(context.Background(), "activate-v2-before-replacement", v2Gate); err == nil {
+		t.Fatal("v2 capability gate activated while a v1-only voter remained")
 	}
 	if _, present, err := leader.raftServerSuffrage(joinNodeID); err != nil || present {
 		t.Fatalf("prepared join unexpectedly changed Raft configuration: present=%t err=%v", present, err)
@@ -226,12 +240,16 @@ func TestThreeNodeElectionReplicationAndFailover(t *testing.T) {
 	if err != nil || !ok || operation.Phase != MembershipPhaseCompleted {
 		t.Fatalf("join recovery did not complete: operation=%#v ok=%t err=%v", operation, ok, err)
 	}
-	replacedNodeID := ""
-	for _, nodeID := range nodeIDs {
-		if nodeID != leader.NodeID() {
-			replacedNodeID = nodeID
-			break
+	replacedNodeID := "node-c"
+	if leader.NodeID() == replacedNodeID {
+		transferTarget := "node-a"
+		if transferTarget == replacedNodeID {
+			transferTarget = "node-b"
 		}
+		if err := leader.TransferLeadership(context.Background(), transferTarget); err != nil {
+			t.Fatal(err)
+		}
+		leader = waitForSingleLeader(t, nodes, 20*time.Second)
 	}
 	if err := leader.RemoveServer(context.Background(), replacedNodeID); err != nil {
 		t.Fatal(err)
@@ -249,6 +267,16 @@ func TestThreeNodeElectionReplicationAndFailover(t *testing.T) {
 		_, trusted := leader.peers.Member(replacedNodeID)
 		return !trusted
 	})
+	if _, err := leader.ActivateCapabilities(context.Background(), "activate-v2-after-replacement", v2Gate); err != nil {
+		t.Fatal(err)
+	}
+	state = leader.Metadata()
+	if state.CapabilityGate.ProtocolVersion != 2 || state.CapabilityGate.CommandVersion != 2 {
+		t.Fatalf("v2 gate was not activated: %#v", state.CapabilityGate)
+	}
+	if _, err := leader.PutMetadata(context.Background(), "v2-command", "test/v2", true, state.Revision); err != nil {
+		t.Fatal(err)
+	}
 
 	oldEpoch := leader.Status().LeaderEpoch
 	if err := leader.Close(); err != nil {
@@ -267,6 +295,16 @@ func TestThreeNodeElectionReplicationAndFailover(t *testing.T) {
 	}
 	if _, ok := newLeader.Metadata().Values["runtime/features"]; !ok {
 		t.Fatal("replicated metadata missing after failover")
+	}
+}
+
+func testV2Capabilities() NodeCapabilities {
+	return NodeCapabilities{
+		CapabilityLevel: 2,
+		Protocol:        VersionRange{Min: 1, Max: 2},
+		Command:         VersionRange{Min: 1, Max: 2},
+		ManifestSchema:  VersionRange{Min: 1, Max: 2},
+		DatasetSchema:   VersionRange{Min: 1, Max: 2},
 	}
 }
 
