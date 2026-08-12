@@ -37,17 +37,39 @@ type compatProcess struct {
 	logs   bytes.Buffer
 }
 
-func TestNNPlusOneIndependentBinaryCompatibility(t *testing.T) {
+const compatOldSourceCommit = "1d1882273a13"
+
+func TestNNPlusOneSourceCompatibility(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping independent binary compatibility test in short mode")
+		t.Skip("skipping source compatibility test in short mode")
 	}
 	if *compatChildMode {
 		t.Skip("parent test is disabled in child mode")
 	}
 
 	binDir := t.TempDir()
-	oldBinary := buildCompatBinary(t, binDir, "clusterha-n.test", "1")
-	newBinary := buildCompatBinary(t, binDir, "clusterha-nplus1.test", "2")
+	oldSource := exportCompatOldSource(t)
+	oldBinary := buildCompatBinary(t, oldSource, binDir, "clusterha-n.test", "1")
+	newBinary := buildCompatBinary(t, ".", binDir, "clusterha-nplus1.test", "2")
+	runCompatClusterScenario(t, oldBinary, newBinary)
+}
+
+func TestCapabilityGateIndependentBinaryIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping capability gate binary integration test in short mode")
+	}
+	if *compatChildMode {
+		t.Skip("parent test is disabled in child mode")
+	}
+
+	binDir := t.TempDir()
+	oldBinary := buildCompatBinary(t, ".", binDir, "clusterha-capability-level1.test", "1")
+	newBinary := buildCompatBinary(t, ".", binDir, "clusterha-capability-level2.test", "2")
+	runCompatClusterScenario(t, oldBinary, newBinary)
+}
+
+func runCompatClusterScenario(t *testing.T, oldBinary, newBinary string) {
+	t.Helper()
 
 	serverName := "clusterha.test"
 	caCert, caKey, caFile := createTestCA(t)
@@ -200,14 +222,52 @@ func TestClusterHACompatChildProcess(t *testing.T) {
 	<-signals
 }
 
-func buildCompatBinary(t *testing.T, dir, name, capabilityLevel string) string {
+func exportCompatOldSource(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	archive := exec.Command("git", "archive", compatOldSourceCommit)
+	extract := exec.Command("tar", "-x", "-C", dir)
+	pipe, err := archive.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	extract.Stdin = pipe
+	var archiveLogs bytes.Buffer
+	var extractLogs bytes.Buffer
+	archive.Stderr = &archiveLogs
+	extract.Stderr = &extractLogs
+	if err := extract.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Start(); err != nil {
+		t.Fatal(err)
+	}
+	archiveErr := archive.Wait()
+	_ = pipe.Close()
+	extractErr := extract.Wait()
+	if archiveErr != nil || extractErr != nil {
+		t.Fatalf("export old source commit=%s archive=%v extract=%v\narchive logs:\n%s\nextract logs:\n%s",
+			compatOldSourceCommit, archiveErr, extractErr, archiveLogs.String(), extractLogs.String())
+	}
+	harness, err := os.ReadFile("compat_binary_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "compat_binary_test.go"), harness, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func buildCompatBinary(t *testing.T, sourceDir, dir, name, capabilityLevel string) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
 	cmd := exec.Command("go", "test", "-c", "-o", path, "-ldflags",
 		fmt.Sprintf("-X github.com/kongfei605/go-clusterha.compatCapabilityLevel=%s", capabilityLevel), ".")
+	cmd.Dir = sourceDir
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("build compat binary level=%s: %v\n%s", capabilityLevel, err, output)
+		t.Fatalf("build compat binary source=%s level=%s: %v\n%s", sourceDir, capabilityLevel, err, output)
 	}
 	return path
 }

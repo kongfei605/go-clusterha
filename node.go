@@ -1661,6 +1661,9 @@ func (n *Node) ProxyToLeader(w http.ResponseWriter, r *http.Request, targetGener
 	if targetGeneration.IsZero() {
 		return ErrProxyUnavailable
 	}
+	if !leaderStatusCanServeGeneration(leaderStatus, targetGeneration) {
+		return ErrProxyUnavailable
+	}
 	proxyURL := strings.TrimRight(base, "/") + "/internal/v1/proxy" + r.URL.RequestURI()
 	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, proxyURL, r.Body)
 	if err != nil {
@@ -1999,6 +2002,10 @@ func containsGeneration(generations []Generation, wanted Generation) bool {
 		}
 	}
 	return false
+}
+
+func leaderStatusCanServeGeneration(status Status, generation Generation) bool {
+	return !generation.IsZero() && containsGeneration(status.AvailableGenerations, generation)
 }
 
 func (n *Node) Metadata() MetadataState {

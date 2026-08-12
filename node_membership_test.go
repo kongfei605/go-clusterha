@@ -57,6 +57,21 @@ func TestValidateCapabilityActivationVotersRequiresLeaderEligibleVoter(t *testin
 	}
 }
 
+func TestLeaderStatusCanServeGenerationRequiresAvailableGeneration(t *testing.T) {
+	generation := Generation{ClusterID: "cluster", LeaderEpoch: 1, Sequence: 2, ManifestHash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	status := Status{CommittedGeneration: generation}
+	if leaderStatusCanServeGeneration(status, generation) {
+		t.Fatal("generation absent from AvailableGenerations was accepted")
+	}
+	status.AvailableGenerations = []Generation{generation}
+	if !leaderStatusCanServeGeneration(status, generation) {
+		t.Fatal("available generation was rejected")
+	}
+	if leaderStatusCanServeGeneration(status, Generation{}) {
+		t.Fatal("zero target generation was accepted")
+	}
+}
+
 func TestRefreshPeerRegistryRevokesRemovedOperationMember(t *testing.T) {
 	fsm := newMetadataFSM("cluster")
 	members := map[string]Member{
