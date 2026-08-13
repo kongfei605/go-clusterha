@@ -216,8 +216,8 @@ func TestMetadataFSMRejectsNonConsecutiveSnapshotSequence(t *testing.T) {
 	fsm.state.LeaderEpoch = 1
 	fsm.state.LeaderOwner = "node-a"
 	fsm.state.CapabilityGate = LegacyCapabilityGate()
-	fsm.state.CapabilityGate.MinimumLeaderCapability = 3
-	fsm.state.CapabilityGate.MinimumVoterCapability = 3
+	fsm.state.CapabilityGate.MinimumLeaderCapability = CapabilityLevelMonotonicSnapshotSequence
+	fsm.state.CapabilityGate.MinimumVoterCapability = CapabilityLevelMonotonicSnapshotSequence
 	apply := func(index, sequence uint64) applyResult {
 		manifest := Manifest{SchemaVersion: 1,
 			Generation: Generation{ClusterID: "cluster", LeaderEpoch: 1, Sequence: sequence},

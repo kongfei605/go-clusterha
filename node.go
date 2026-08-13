@@ -709,7 +709,7 @@ func (n *Node) PublishSnapshot(ctx context.Context, commandID string, manifest M
 	if err := ValidateManifest(manifest); err != nil {
 		return 0, err
 	}
-	if gate.MinimumVoterCapability >= 3 {
+	if gate.MinimumVoterCapability >= CapabilityLevelMonotonicSnapshotSequence {
 		previous, hasPrevious := n.ActiveSnapshot()
 		if err := validateNextSnapshotSequence(previous, hasPrevious, manifest.Generation.Sequence); err != nil {
 			return 0, err

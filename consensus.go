@@ -247,7 +247,7 @@ func (f *metadataFSM) Apply(log *raft.Log) any {
 		if payload.Manifest.Generation.LeaderEpoch != f.state.LeaderEpoch {
 			return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: "snapshot leader epoch is not current"}
 		}
-		if gate.MinimumVoterCapability >= 3 {
+		if gate.MinimumVoterCapability >= CapabilityLevelMonotonicSnapshotSequence {
 			var previous Manifest
 			hasPrevious := f.state.ActiveSnapshot != ""
 			if hasPrevious {

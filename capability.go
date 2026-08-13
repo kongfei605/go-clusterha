@@ -10,16 +10,18 @@ const (
 	LegacyManifestSchemaVersion uint32 = 1
 	LegacyDatasetSchemaVersion  uint32 = 1
 
-	CurrentProtocolVersion       uint32 = 1
-	CurrentCommandVersion        uint32 = 1
-	CurrentManifestSchemaVersion uint32 = 2
-	CurrentDatasetSchemaVersion  uint32 = 2
+	CurrentProtocolVersion                   uint32 = 1
+	CurrentCommandVersion                    uint32 = 1
+	CurrentManifestSchemaVersion             uint32 = 2
+	CurrentDatasetSchemaVersion              uint32 = 2
+	CapabilityLevelReplicatedControllers     uint32 = 3
+	CapabilityLevelMonotonicSnapshotSequence uint32 = 3
 	// Level 3 fences binaries that predate application-level replicated
 	// controller state machines and monotonic snapshot-sequence validation.
 	// Protocol and snapshot schema ranges remain backward compatible;
 	// applications activate the higher minimum only after every voter reports
 	// this capability.
-	CurrentCapabilityLevel uint32 = 3
+	CurrentCapabilityLevel uint32 = CapabilityLevelMonotonicSnapshotSequence
 )
 
 type VersionRange struct {
