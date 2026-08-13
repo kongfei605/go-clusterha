@@ -45,6 +45,20 @@ type Manifest struct {
 	Datasets                map[string]DatasetRef `json:"datasets"`
 }
 
+func validateNextSnapshotSequence(previous Manifest, hasPrevious bool, sequence uint64) error {
+	expected := uint64(1)
+	if hasPrevious {
+		if previous.Generation.Sequence == ^uint64(0) {
+			return fmt.Errorf("snapshot generation sequence exhausted")
+		}
+		expected = previous.Generation.Sequence + 1
+	}
+	if sequence != expected {
+		return fmt.Errorf("snapshot generation sequence must be %d, got %d", expected, sequence)
+	}
+	return nil
+}
+
 type DatasetRef struct {
 	Name              string            `json:"name"`
 	SchemaVersion     uint32            `json:"schema_version"`

@@ -247,6 +247,20 @@ func (f *metadataFSM) Apply(log *raft.Log) any {
 		if payload.Manifest.Generation.LeaderEpoch != f.state.LeaderEpoch {
 			return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: "snapshot leader epoch is not current"}
 		}
+		if gate.MinimumVoterCapability >= 3 {
+			var previous Manifest
+			hasPrevious := f.state.ActiveSnapshot != ""
+			if hasPrevious {
+				var ok bool
+				previous, ok = f.state.Snapshots[f.state.ActiveSnapshot]
+				if !ok {
+					return f.recordApplyFaultLocked(log.Index, "active snapshot manifest is missing from FSM state")
+				}
+			}
+			if err := validateNextSnapshotSequence(previous, hasPrevious, payload.Manifest.Generation.Sequence); err != nil {
+				return applyResult{Revision: f.state.Revision, LeaderEpoch: f.state.LeaderEpoch, Error: err.Error()}
+			}
+		}
 		if err := validateManifestCapability(payload.Manifest, gate); err != nil {
 			return f.recordApplyFaultLocked(log.Index, err.Error())
 		}

@@ -702,11 +702,18 @@ func (n *Node) PublishSnapshot(ctx context.Context, commandID string, manifest M
 	if store == nil {
 		return 0, ErrNodeNotStarted
 	}
-	if err := validateManifestCapability(manifest, n.Metadata().CapabilityGate); err != nil {
+	gate := normalizeCapabilityGate(n.Metadata().CapabilityGate)
+	if err := validateManifestCapability(manifest, gate); err != nil {
 		return 0, err
 	}
 	if err := ValidateManifest(manifest); err != nil {
 		return 0, err
+	}
+	if gate.MinimumVoterCapability >= 3 {
+		previous, hasPrevious := n.ActiveSnapshot()
+		if err := validateNextSnapshotSequence(previous, hasPrevious, manifest.Generation.Sequence); err != nil {
+			return 0, err
+		}
 	}
 	n.retainStagingBlobs(manifest)
 	defer n.releaseStagingBlobs(manifest)

@@ -3,6 +3,7 @@ package clusterha
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -207,6 +208,55 @@ func TestMetadataFSMRejectsManifestOutsideCapabilityGate(t *testing.T) {
 	})}).(applyResult)
 	if result.Error == "" || fsm.State().ActiveSnapshot != "" {
 		t.Fatalf("future manifest was accepted: result=%#v", result)
+	}
+}
+
+func TestMetadataFSMRejectsNonConsecutiveSnapshotSequence(t *testing.T) {
+	fsm := newMetadataFSM("cluster")
+	fsm.state.LeaderEpoch = 1
+	fsm.state.LeaderOwner = "node-a"
+	fsm.state.CapabilityGate = LegacyCapabilityGate()
+	fsm.state.CapabilityGate.MinimumLeaderCapability = 3
+	fsm.state.CapabilityGate.MinimumVoterCapability = 3
+	apply := func(index, sequence uint64) applyResult {
+		manifest := Manifest{SchemaVersion: 1,
+			Generation: Generation{ClusterID: "cluster", LeaderEpoch: 1, Sequence: sequence},
+			CreatedAt:  time.Unix(int64(index), 0).UTC(), Datasets: map[string]DatasetRef{}}
+		manifest.Generation.ManifestHash, _ = ComputeManifestHash(manifest)
+		return fsm.Apply(&raft.Log{Index: index, Data: mustJSON(t, Command{
+			ID: fmt.Sprintf("snapshot-%d", index), Type: CommandCommitSnapshot, LeaderEpoch: 1,
+			Payload: mustJSON(t, commitSnapshotPayload{Manifest: manifest}), CreatedAt: time.Unix(0, 0).UTC(),
+		})}).(applyResult)
+	}
+	if result := apply(1, 1); result.Error != "" {
+		t.Fatalf("initial snapshot failed: %s", result.Error)
+	}
+	first := fsm.State().ActiveSnapshot
+	if result := apply(2, 1); result.Error == "" {
+		t.Fatal("duplicate sequence was accepted")
+	}
+	if fsm.State().ActiveSnapshot != first {
+		t.Fatal("rejected duplicate sequence changed the active snapshot")
+	}
+	if result := apply(3, 2); result.Error != "" {
+		t.Fatalf("consecutive snapshot failed: %s", result.Error)
+	}
+}
+
+func TestMetadataFSMPreservesLegacySnapshotSequenceBeforeCapabilityActivation(t *testing.T) {
+	fsm := newMetadataFSM("cluster")
+	fsm.state.LeaderEpoch = 1
+	fsm.state.LeaderOwner = "node-a"
+	manifest := Manifest{SchemaVersion: 1,
+		Generation: Generation{ClusterID: "cluster", LeaderEpoch: 1, Sequence: 123456789},
+		CreatedAt:  time.Unix(1, 0).UTC(), Datasets: map[string]DatasetRef{}}
+	manifest.Generation.ManifestHash, _ = ComputeManifestHash(manifest)
+	result := fsm.Apply(&raft.Log{Index: 1, Data: mustJSON(t, Command{
+		ID: "legacy-snapshot-sequence", Type: CommandCommitSnapshot, LeaderEpoch: 1,
+		Payload: mustJSON(t, commitSnapshotPayload{Manifest: manifest}), CreatedAt: time.Unix(0, 0).UTC(),
+	})}).(applyResult)
+	if result.Error != "" {
+		t.Fatalf("legacy sequence was rejected before capability activation: %s", result.Error)
 	}
 }
 

@@ -271,8 +271,12 @@ func TestClusterHACompatChildProcess(t *testing.T) {
 		data := []byte(req.Value)
 		blobHash := compatBlobHash(data)
 		status := node.Status()
+		sequence := uint64(1)
+		if active, ok := node.ActiveSnapshot(); ok {
+			sequence = active.Generation.Sequence + 1
+		}
 		manifest := Manifest{SchemaVersion: 1, Generation: Generation{ClusterID: status.ClusterID, LeaderEpoch: status.LeaderEpoch,
-			Sequence: node.Metadata().Revision + 1}, CreatedAt: time.Now().UTC(), Datasets: map[string]DatasetRef{"compat": {
+			Sequence: sequence}, CreatedAt: time.Now().UTC(), Datasets: map[string]DatasetRef{"compat": {
 			Name: "compat", SchemaVersion: 1, Scope: "global", BlobHash: blobHash, Encoding: "text", RecordCount: 1,
 			CollectedAt: time.Now().UTC(), SourceSuccess: true, Required: true}}}
 		if _, err := node.PublishSnapshot(r.Context(), fmt.Sprintf("compat/publish/%d", manifest.Generation.Sequence), manifest,

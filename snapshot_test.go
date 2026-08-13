@@ -205,6 +205,28 @@ func TestComputeManifestHashIgnoresExistingManifestHash(t *testing.T) {
 	}
 }
 
+func TestValidateNextSnapshotSequence(t *testing.T) {
+	if err := validateNextSnapshotSequence(Manifest{}, false, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateNextSnapshotSequence(Manifest{}, false, 2); err == nil {
+		t.Fatal("first sequence greater than one was accepted")
+	}
+	previous := Manifest{Generation: Generation{Sequence: 41}}
+	if err := validateNextSnapshotSequence(previous, true, 42); err != nil {
+		t.Fatal(err)
+	}
+	for _, sequence := range []uint64{41, 43} {
+		if err := validateNextSnapshotSequence(previous, true, sequence); err == nil {
+			t.Fatalf("non-consecutive sequence %d was accepted", sequence)
+		}
+	}
+	previous.Generation.Sequence = ^uint64(0)
+	if err := validateNextSnapshotSequence(previous, true, 0); err == nil {
+		t.Fatal("sequence overflow was accepted")
+	}
+}
+
 func TestManifestCapabilityTreatsZeroSchemaAsLegacyV1(t *testing.T) {
 	manifest := Manifest{Datasets: map[string]DatasetRef{"wan": {Name: "wan"}}}
 	if err := validateManifestCapability(manifest, LegacyCapabilityGate()); err != nil {
