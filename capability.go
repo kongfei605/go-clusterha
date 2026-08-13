@@ -14,7 +14,11 @@ const (
 	CurrentCommandVersion        uint32 = 1
 	CurrentManifestSchemaVersion uint32 = 2
 	CurrentDatasetSchemaVersion  uint32 = 2
-	CurrentCapabilityLevel       uint32 = 2
+	// Level 3 fences binaries that predate application-level replicated
+	// controller state machines. Protocol and snapshot schema ranges remain
+	// backward compatible; applications activate the higher minimum only after
+	// every voter reports this capability.
+	CurrentCapabilityLevel uint32 = 3
 )
 
 type VersionRange struct {
